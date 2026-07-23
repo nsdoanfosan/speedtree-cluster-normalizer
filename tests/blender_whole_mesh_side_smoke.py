@@ -26,17 +26,18 @@ def side_camera_bundle(source, pivot, normalization, output_path, margin_ratio):
         "view_direction": [-1.0, 0.0, 0.0],
         "plane_normal": [1.0, 0.0, 0.0],
     }
-    frame = normalization.whole_mesh_frame(source, pivot)
+    source_frame = normalization.whole_mesh_frame(source, pivot)
+    frame = normalization.camera_aligned_frame(
+        source,
+        source_frame,
+        range(len(source.data.vertices)),
+        camera,
+    )
     source_to_part = frame["matrix_world"].inverted_safe() @ source.matrix_world
-    basis = normalization.camera_projection_basis_in_part(frame, camera)
-    right_local = Vector(basis["right"])
-    up_local = Vector(basis["up"])
     local_points = [source_to_part @ vertex.co for vertex in source.data.vertices]
     hull = normalization.expanded_hull(
-        [
-            (float(point.dot(right_local)), float(point.dot(up_local)))
-            for point in local_points
-        ],
+        [(float(point.x), float(point.y)) for point in local_points]
+        + [(0.0, 0.0)],
         margin_ratio,
     )
     minimum_x = min(point[0] for point in hull)
@@ -143,6 +144,10 @@ def main():
     args = parse_args()
     addon_utils.enable("speedtree_cluster_normalizer", default_set=False)
     import speedtree_cluster_normalizer.normalization as normalization
+    from speedtree_cluster_normalizer.delivery_validation import (
+        _validate_external_camera_uv,
+        _vertex_uvs,
+    )
 
     test_dir = Path(__file__).resolve().parent
     if str(test_dir) not in sys.path:
@@ -192,12 +197,57 @@ def main():
     actual_export = {obj.name for obj in bpy.data.collections["Export"].objects}
     if actual_export != expected_export:
         raise RuntimeError(f"Side Export is not one prototype: {actual_export}")
-    for row in report["variants"]:
+    for row_index, row in enumerate(report["variants"]):
         plan = bpy.data.objects[row["plan"]]
+        part = bpy.data.objects[row["mesh"]]
+        frame_world = Matrix(row["frame_world"])
+        world_geometry_error = max(
+            (
+                frame_world @ part.data.vertices[vertex_index].co
+                - source.matrix_world @ source.data.vertices[vertex_index].co
+            ).length
+            for vertex_index in range(len(source.data.vertices))
+        )
+        if world_geometry_error > 1.0e-5:
+            raise RuntimeError(f"Side camera frame changed 3D world geometry: {row}")
         basis = row["projection_basis"]
-        normal = Vector(basis["normal"])
-        if any(abs(float(vertex.co.dot(normal))) > 1.0e-6 for vertex in plan.data.vertices):
-            raise RuntimeError(f"Side plan left its stored projection plane: {plan.name}")
+        if (
+            basis.get("policy") != "camera_aligned_canonical_local_xy"
+            or Vector(basis["right"]) != Vector((1.0, 0.0, 0.0))
+            or Vector(basis["up"]) != Vector((0.0, 1.0, 0.0))
+            or Vector(basis["normal"]) != Vector((0.0, 0.0, 1.0))
+            or any(abs(float(vertex.co.z)) > 1.0e-6 for vertex in plan.data.vertices)
+        ):
+            raise RuntimeError(f"Side plan is not exact canonical local XY: {plan.name}")
+        if row.get("frame_policy") != normalization.CAMERA_ALIGNED_FRAME_POLICY:
+            raise RuntimeError(f"Side prototype did not share the camera-aligned frame: {row}")
+        transfer = row["plan_uv_transfer"]
+        actual_plan_uvs = _vertex_uvs(
+            plan.data,
+            expected_uvs=transfer["result_uvs"],
+            label=plan.name,
+        )
+        _validate_external_camera_uv(
+            plan,
+            bundle["contract"]["planes"][row_index],
+            bundle["contract"]["camera"],
+            actual_plan_uvs,
+            transfer,
+        )
+        attachment_index = int(transfer["attachment_vertex_index"])
+        if plan.data.vertices[attachment_index].co.length > 1.0e-8:
+            raise RuntimeError(f"Side plan attachment is not local origin: {plan.name}")
+        if max(
+            abs(
+                transfer["result_uvs"][attachment_index][axis]
+                - transfer["reference_pivot_uv"][axis]
+            )
+            for axis in range(2)
+        ) > 1.0e-7:
+            raise RuntimeError(f"Side plan attachment UV is not pinned: {plan.name}")
+        coverage = row.get("plan_projection_coverage") or {}
+        if coverage.get("covers_projection") is not True or coverage.get("outside_point_count") != 0:
+            raise RuntimeError(f"Side plan measured coverage failed: {row}")
         if plan.get(normalization.COUNTERPART_KEY) != "SK_leaf_elm_side_01_01":
             raise RuntimeError(f"Side plan counterpart mismatch: {plan.name}")
     for index in range(1, 4):

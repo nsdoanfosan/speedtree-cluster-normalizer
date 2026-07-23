@@ -24,6 +24,7 @@ PROTOTYPE_INDEX_KEY = "speedtree_cluster_prototype_index"
 PROTOTYPE_ASSET_KEY = "speedtree_cluster_prototype_asset"
 SOURCE_PARTITION_MODE_KEY = "speedtree_cluster_source_partition_mode"
 PROJECTION_BASIS_KEY = "speedtree_cluster_projection_basis"
+PROJECTION_COVERAGE_KEY = "speedtree_cluster_projection_coverage"
 CARD_PROTOTYPE_MAP_KEY = "speedtree_cluster_card_prototype_map"
 CARD_PROTOTYPE_MAP_HASH_KEY = "speedtree_cluster_card_prototype_map_sha256"
 COMPOSITE_PARTS_KEY = "speedtree_cluster_composite_parts"
@@ -36,13 +37,14 @@ UV_TRANSFER_KEY = "speedtree_cluster_uv_transfer"
 # side captures while the separate planarity, coverage, orientation, and UV
 # invariants continue to fail closed.
 UV_TRANSFER_MAX_NORMALIZED_RMS = 0.5
-UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR = 0.2
+UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR = 0.0
 UV_TRANSFER_ATTACHMENT_POLICY = (
-    "normalized_plan_origin_to_camera_contract_source_plane_xy"
+    "exact_normalized_plan_origin_to_camera_contract_source_plane_xy"
 )
 UV_TRANSFER_CANDIDATE_SELECTION_POLICY = (
-    "attachment_origin_gate_then_outline_normalized_rms"
+    "exact_attachment_constrained_then_outline_normalized_rms"
 )
+CAMERA_ALIGNED_FRAME_POLICY = "shared_camera_right_up_normal_rigid_frame"
 
 
 def _natural_key(value):
@@ -457,13 +459,86 @@ def pivot_subset_frame(source, pivot, vertex_indices):
     }
 
 
-def camera_projection_basis_in_part(frame, camera):
+def _camera_world_axes(camera):
     try:
-        camera_right = Vector(camera["right"])
-        camera_up = Vector(camera["up"])
-        camera_normal = Vector(camera["plane_normal"])
+        right = Vector(camera["right"])
+        up = Vector(camera["up"])
+        expected_normal = Vector(camera["plane_normal"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Camera contract lacks a numeric right/up/normal basis.") from exc
+    if min(right.length, up.length, expected_normal.length) <= 1.0e-12:
+        raise ValueError("Camera basis contains a zero-length axis.")
+    right.normalize()
+    up = up - right * up.dot(right)
+    if up.length <= 1.0e-12:
+        raise ValueError("Camera right/up axes collapse during rigid normalization.")
+    up.normalize()
+    normal = right.cross(up)
+    normal.normalize()
+    expected_normal.normalize()
+    if normal.dot(expected_normal) < 0.999999:
+        raise ValueError("Camera right/up/normal basis is not consistently right-handed.")
+    return right, up, normal
+
+
+def camera_aligned_frame(source, source_frame, vertex_indices, camera):
+    """Keep the validated attachment origin while replacing orientation with the camera basis."""
+    indices = sorted({int(index) for index in vertex_indices})
+    if len(indices) < 3:
+        raise ValueError("Camera-aligned frame requires at least three source vertices.")
+    right, up, normal = _camera_world_axes(camera)
+    origin = source_frame["matrix_world"].translation.copy()
+    matrix_world = Matrix.Identity(4)
+    for row in range(3):
+        matrix_world[row][0] = right[row]
+        matrix_world[row][1] = up[row]
+        matrix_world[row][2] = normal[row]
+        matrix_world[row][3] = origin[row]
+    transform = matrix_world.inverted() @ source.matrix_world
+    local_points = [transform @ source.data.vertices[index].co for index in indices]
+    bounds = _bounds(local_points)
+    if bounds is None or max(bounds["size"]) <= 0.0:
+        raise ValueError("Camera-aligned source subset has no measurable geometry.")
+    endpoint_length = max(float(bounds["size"][1]), max(bounds["size"]) * 0.05)
+    endpoint = matrix_world @ Vector((0.0, endpoint_length, 0.0))
+    return {
+        "matrix_world": matrix_world,
+        "origin_world": [float(value) for value in origin],
+        "endpoint_world": [float(value) for value in endpoint],
+        "endpoint_length": float(endpoint_length),
+        "source_world_bounds": _bounds(
+            [source.matrix_world @ source.data.vertices[index].co for index in indices]
+        ),
+        "normalized_bounds": bounds,
+        "orientation_policy": CAMERA_ALIGNED_FRAME_POLICY,
+        "source_frame_world": source_frame["matrix_world"].copy(),
+        "source_endpoint_world": list(source_frame.get("endpoint_world") or []),
+        "pivot_object": source_frame.get("pivot_object"),
+    }
+
+
+def camera_projection_basis_in_part(frame, camera):
+    camera_right, camera_up, camera_normal = _camera_world_axes(camera)
+    if frame.get("orientation_policy") == CAMERA_ALIGNED_FRAME_POLICY:
+        frame_axes = [
+            Vector(frame["matrix_world"].to_3x3().col[index]).normalized()
+            for index in range(3)
+        ]
+        camera_axes = (camera_right, camera_up, camera_normal)
+        if any(
+            frame_axis.dot(camera_axis) < 0.999999
+            for frame_axis, camera_axis in zip(frame_axes, camera_axes)
+        ):
+            raise ValueError("Camera-aligned frame drifted from its source camera basis.")
+        return {
+            "policy": "camera_aligned_canonical_local_xy",
+            "right": [1.0, 0.0, 0.0],
+            "up": [0.0, 1.0, 0.0],
+            "normal": [0.0, 0.0, 1.0],
+            "source_camera_right": [float(value) for value in camera_right],
+            "source_camera_up": [float(value) for value in camera_up],
+            "source_camera_normal": [float(value) for value in camera_normal],
+        }
     world_to_part = frame["matrix_world"].inverted_safe().to_3x3()
     right = world_to_part @ camera_right
     up = world_to_part @ camera_up
@@ -574,6 +649,32 @@ def point_in_convex_polygon(point, polygon, tolerance=1.0e-7):
             return False
         sign = current
     return True
+
+
+def projection_coverage_2d(points, polygon):
+    projected = [tuple(float(value) for value in point[:2]) for point in points]
+    boundary = [tuple(float(value) for value in point[:2]) for point in polygon]
+    if not projected or len(boundary) < 3:
+        raise ValueError("Projection coverage needs source points and a polygon boundary.")
+    spans = [
+        max(point[axis] for point in boundary)
+        - min(point[axis] for point in boundary)
+        for axis in range(2)
+    ]
+    tolerance = max(max(spans), 1.0e-6) ** 2 * 1.0e-7
+    outside_indices = [
+        index
+        for index, point in enumerate(projected)
+        if not point_in_convex_polygon(point, boundary, tolerance=tolerance)
+    ]
+    return {
+        "covers_projection": not outside_indices,
+        "projected_point_count": len(projected),
+        "outside_point_count": len(outside_indices),
+        "outside_point_indices": outside_indices,
+        "boundary_vertex_count": len(boundary),
+        "cross_product_tolerance": float(tolerance),
+    }
 
 
 def _is_generated(data_block):
@@ -700,8 +801,8 @@ def _compact_material_slots(mesh):
         mesh.materials.clear()
         return
     original = list(mesh.materials)
-    remap = {old: new for new, old in enumerate(used_indices)}
     original_polygon_indices = [polygon.material_index for polygon in mesh.polygons]
+    remap = {old: new for new, old in enumerate(used_indices)}
     mesh.materials.clear()
     for index in used_indices:
         if index >= len(original) or original[index] is None:
@@ -807,6 +908,10 @@ def _build_part_hierarchy(
     mesh[GENERATED_FLAG] = True
     armature_data[GENERATED_FLAG] = True
     part["speedtree_cluster_frame_world"] = json.dumps(_matrix_rows(frame["matrix_world"]))
+    if frame.get("source_frame_world") is not None:
+        part["speedtree_cluster_source_frame_world"] = json.dumps(
+            _matrix_rows(frame["source_frame_world"])
+        )
     return pivot, armature, part
 
 
@@ -887,11 +992,22 @@ def _resample_closed_loop(points, count):
     return result, parameters, fractions
 
 
-def _similarity_fit(source, target):
+def _similarity_fit(source, target, *, source_attachment=None, target_attachment=None):
     source = np.asarray(source, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
-    source_center = source.mean(axis=0)
-    target_center = target.mean(axis=0)
+    if source_attachment is None or target_attachment is None:
+        source_center = source.mean(axis=0)
+        target_center = target.mean(axis=0)
+    else:
+        source_center = np.asarray(source_attachment, dtype=np.float64)
+        target_center = np.asarray(target_attachment, dtype=np.float64)
+        if (
+            source_center.shape != (2,)
+            or target_center.shape != (2,)
+            or not np.isfinite(source_center).all()
+            or not np.isfinite(target_center).all()
+        ):
+            raise ValueError("Similarity attachment constraints are malformed.")
     centered_source = source - source_center
     centered_target = target - target_center
     denominator = float(np.sum(centered_source * centered_source))
@@ -909,9 +1025,8 @@ def _similarity_fit(source, target):
     fitted = scale * (source @ rotation) + translation
     residual = fitted - target
     rms = float(np.sqrt(np.mean(np.sum(residual * residual, axis=1))))
-    target_radius = float(
-        np.sqrt(np.mean(np.sum(centered_target * centered_target, axis=1)))
-    )
+    radius_points = target - target.mean(axis=0)
+    target_radius = float(np.sqrt(np.mean(np.sum(radius_points * radius_points, axis=1))))
     if target_radius <= 1.0e-20:
         raise ValueError("Camera reference boundary is degenerate.")
     return {
@@ -967,6 +1082,10 @@ def _transfer_camera_boundary_uvs(
         (reference_plane.get("attachment") or {}).get("source_plane_xy"),
         dtype=np.float64,
     )
+    reference_pivot_uv = np.asarray(
+        (reference_plane.get("attachment") or {}).get("pivot_uv"),
+        dtype=np.float64,
+    )
     if not (
         np.isfinite(plan_boundary).all()
         and np.isfinite(reference_vertices).all()
@@ -975,6 +1094,8 @@ def _transfer_camera_boundary_uvs(
         and np.isfinite(plan_attachment).all()
         and reference_attachment.shape == (2,)
         and np.isfinite(reference_attachment).all()
+        and reference_pivot_uv.shape == (2,)
+        and np.isfinite(reference_pivot_uv).all()
     ):
         raise ValueError(
             "Camera-template transfer requires finite plan/reference attachment coordinates."
@@ -1010,7 +1131,12 @@ def _transfer_camera_boundary_uvs(
         for shift in range(sample_count):
             shifted = np.roll(reference_samples, shift, axis=0)
             try:
-                fit = _similarity_fit(plan_samples, shifted)
+                fit = _similarity_fit(
+                    plan_samples,
+                    shifted,
+                    source_attachment=plan_attachment,
+                    target_attachment=reference_attachment,
+                )
             except ValueError:
                 continue
             mapped_attachment = (
@@ -1044,11 +1170,11 @@ def _transfer_camera_boundary_uvs(
     ]
     if not finite_candidates:
         raise ValueError("Camera-template alignment did not produce a finite solution.")
+    attachment_tolerance = reference_extent_diagonal * 1.0e-12
     anchor_candidates = [
         candidate
         for candidate in finite_candidates
-        if candidate["attachment_error_normalized"]
-        <= UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR
+        if candidate["attachment_error"] <= attachment_tolerance
     ]
     if not anchor_candidates:
         nearest = min(
@@ -1061,9 +1187,8 @@ def _transfer_camera_boundary_uvs(
             ),
         )
         raise ValueError(
-            "Camera-template attachment alignment is ambiguous: normalized origin error "
-            f"{nearest['attachment_error_normalized']:.6f} exceeds "
-            f"{UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR:.6f}."
+            "Camera-template attachment constraint was not exact: origin error "
+            f"{nearest['attachment_error']:.12g}."
         )
     best = min(
         anchor_candidates,
@@ -1111,6 +1236,7 @@ def _transfer_camera_boundary_uvs(
         "reference_attachment_xy": [
             float(value) for value in reference_attachment
         ],
+        "reference_pivot_uv": [float(value) for value in reference_pivot_uv],
         "mapped_attachment_xy": [
             float(value) for value in best["mapped_attachment"]
         ],
@@ -1237,7 +1363,14 @@ def _mean_value_boundary_uv(point, boundary, boundary_uvs, tolerance):
     return tuple(float(value) for value in uv)
 
 
-def _uniform_plan_triangulation(boundary, boundary_uvs, refinement_levels):
+def _uniform_plan_triangulation(
+    boundary,
+    boundary_uvs,
+    refinement_levels,
+    *,
+    attachment_point=(0.0, 0.0),
+    attachment_uv=None,
+):
     """Build a constrained, near-uniform interior instead of an ear-clipped fan."""
     levels = int(refinement_levels)
     if levels < 0 or levels > 2:
@@ -1255,8 +1388,26 @@ def _uniform_plan_triangulation(boundary, boundary_uvs, refinement_levels):
     diagonal = math.hypot(maximum_x - minimum_x, maximum_y - minimum_y)
     if area <= 1.0e-20 or diagonal <= 1.0e-20:
         raise ValueError("Plan boundary has no measurable area.")
-
+    attachment_point = tuple(float(value) for value in attachment_point)
+    if len(attachment_point) != 2 or not all(
+        math.isfinite(value) for value in attachment_point
+    ):
+        raise ValueError("Plan attachment point is malformed.")
+    if attachment_uv is None:
+        raise ValueError("Plan attachment UV is required.")
+    attachment_uv = tuple(float(value) for value in attachment_uv)
+    if len(attachment_uv) != 2 or not all(
+        math.isfinite(value) for value in attachment_uv
+    ):
+        raise ValueError("Plan attachment UV is malformed.")
     boundary_points = list(points)
+    if not point_in_convex_polygon(
+        attachment_point,
+        boundary_points,
+        tolerance=diagonal * diagonal * 1.0e-12,
+    ):
+        raise ValueError("Plan boundary does not contain its normalized attachment origin.")
+
     if levels > 0:
         target_triangles = min(
             128,
@@ -1327,6 +1478,17 @@ def _uniform_plan_triangulation(boundary, boundary_uvs, refinement_levels):
             if point_in_convex_polygon(centroid, boundary_points):
                 points.append(centroid)
 
+    input_attachment_index = next(
+        (
+            index
+            for index, point in enumerate(points)
+            if math.dist(point, attachment_point) <= diagonal * 1.0e-10
+        ),
+        None,
+    )
+    if input_attachment_index is None:
+        points.append(attachment_point)
+
     boundary_count = len(boundary)
     edges = [
         (index, (index + 1) % boundary_count)
@@ -1348,10 +1510,19 @@ def _uniform_plan_triangulation(boundary, boundary_uvs, refinement_levels):
         _mean_value_boundary_uv(vertex, boundary, boundary_uvs, tolerance)
         for vertex in cdt_vertices
     ]
+    attachment_vertex_index = min(
+        range(len(cdt_vertices)),
+        key=lambda index: math.dist(tuple(cdt_vertices[index]), attachment_point),
+    )
+    if math.dist(tuple(cdt_vertices[attachment_vertex_index]), attachment_point) > tolerance:
+        raise ValueError("CDT did not preserve the normalized attachment origin.")
+    cdt_vertices[attachment_vertex_index] = Vector(attachment_point)
+    result_uvs[attachment_vertex_index] = attachment_uv
     return (
         [tuple(float(value) for value in vertex) for vertex in cdt_vertices],
         result_uvs,
         faces,
+        int(attachment_vertex_index),
     )
 
 
@@ -1538,29 +1709,42 @@ def _build_plan(
     right = Vector(projection_basis["right"])
     up = Vector(projection_basis["up"])
     normal = Vector(projection_basis["normal"])
+    axis_tolerance = 1.0e-7
+    if (
+        (right - Vector((1.0, 0.0, 0.0))).length > axis_tolerance
+        or (up - Vector((0.0, 1.0, 0.0))).length > axis_tolerance
+        or (normal - Vector((0.0, 0.0, 1.0))).length > axis_tolerance
+    ):
+        raise ValueError("Generated plans require the shared camera-aligned local XY frame.")
     points = [
-        (float(point.dot(right)), float(point.dot(up)))
+        (float(point.x), float(point.y))
         for point in coverage_points
     ]
-    hull = expanded_hull(points, margin_ratio)
+    attachment_point = (0.0, 0.0)
+    hull = expanded_hull(points + [attachment_point], margin_ratio)
     transferred_uvs, transfer = _transfer_camera_boundary_uvs(
         hull,
         reference_plane,
         uv_bundle["contract"]["camera"],
-        plan_attachment_xy=(0.0, 0.0),
+        plan_attachment_xy=attachment_point,
     )
     boundary_uvs = transferred_uvs.tolist()
-    triangulated_points, refined_uvs, faces = _uniform_plan_triangulation(
-        hull,
-        boundary_uvs,
-        plan_refinement_levels,
+    pivot_uv = (reference_plane.get("attachment") or {}).get("pivot_uv")
+    triangulated_points, refined_uvs, faces, attachment_vertex_index = (
+        _uniform_plan_triangulation(
+            hull,
+            boundary_uvs,
+            plan_refinement_levels,
+            attachment_point=attachment_point,
+            attachment_uv=pivot_uv,
+        )
     )
     boundary_vertices = [
-        tuple(right * point[0] + up * point[1])
+        (float(point[0]), float(point[1]), 0.0)
         for point in hull
     ]
     vertices = [
-        tuple(right * point[0] + up * point[1])
+        (float(point[0]), float(point[1]), 0.0)
         for point in triangulated_points
     ]
     mesh = bpy.data.meshes.new(plan_name + "_Mesh")
@@ -1589,12 +1773,23 @@ def _build_plan(
     _tag(plan, source, bone_name, endpoint_name, "speedtree_plan", index, skeletal_name)
     mesh[GENERATED_FLAG] = True
     plan["speedtree_cluster_frame_world"] = json.dumps(_matrix_rows(frame["matrix_world"]))
+    if frame.get("source_frame_world") is not None:
+        plan["speedtree_cluster_source_frame_world"] = json.dumps(
+            _matrix_rows(frame["source_frame_world"])
+        )
     plan["speedtree_cluster_margin_ratio"] = float(margin_ratio)
+    plan["speedtree_cluster_attachment_vertex_index"] = int(
+        attachment_vertex_index
+    )
     plan[PROTOTYPE_INDEX_KEY] = int(prototype_index)
     plan[PROTOTYPE_ASSET_KEY] = prototype_asset
     plan[SOURCE_PARTITION_MODE_KEY] = source_partition_mode
     plan[PROJECTION_BASIS_KEY] = json.dumps(
         projection_basis, ensure_ascii=False, sort_keys=True
+    )
+    coverage = projection_coverage_2d(points, hull)
+    plan[PROJECTION_COVERAGE_KEY] = json.dumps(
+        coverage, ensure_ascii=False, sort_keys=True
     )
     transfer.update(
         {
@@ -1614,6 +1809,8 @@ def _build_plan(
             "plan_refinement_levels": int(plan_refinement_levels),
             "boundary_vertex_count": len(boundary_vertices),
             "interior_vertex_count": len(vertices) - len(boundary_vertices),
+            "attachment_vertex_index": int(attachment_vertex_index),
+            "attachment_vertex_uv": [float(value) for value in pivot_uv],
         }
     )
     transfer["result_uv_sha256"] = _canonical_sha256(transfer["result_uvs"])
@@ -1627,17 +1824,12 @@ def _build_plan(
     )
     if maximum_plane_error > 1.0e-6:
         raise ValueError(f"Generated plan left its camera projection plane: {plan_name}")
-    bounds_2d = _bounds([Vector((point[0], point[1], 0.0)) for point in points])
-    tolerance = max(bounds_2d["size"]) ** 2 * 1.0e-7
-    outside = [
-        point for point in points
-        if not point_in_convex_polygon(point, hull, tolerance=tolerance)
-    ]
-    if outside:
+    if not coverage["covers_projection"]:
         raise ValueError(
-            f"Generated plan does not cover {len(outside)} projected vertices: {plan_name}"
+            "Generated plan does not cover "
+            f"{coverage['outside_point_count']} projected vertices: {plan_name}"
         )
-    return plan, hull, transfer
+    return plan, hull, transfer, coverage
 
 
 def configure_send2ue_handoff(scene):
@@ -1762,6 +1954,8 @@ def build_normalized_cluster_assets(
     reference_planes = camera_uv_bundle["contract"].get("planes") or []
     if not reference_planes:
         raise ValueError("Camera UV contract contains no card planes.")
+    camera_contract = camera_uv_bundle["contract"].get("camera") or {}
+    _camera_world_axes(camera_contract)
 
     valid_per_deform_rows = []
     per_deform_error = None
@@ -1829,7 +2023,13 @@ def build_normalized_cluster_assets(
             )
         if resolved_partition_mode == "COMPOSITE_PER_DEFORM_ROOT":
             whole_pivot = _whole_mesh_pivot(source, whole_mesh_pivot_object)
-            composite_frame = whole_mesh_frame(source, whole_pivot)
+            composite_source_frame = whole_mesh_frame(source, whole_pivot)
+            composite_frame = camera_aligned_frame(
+                source,
+                composite_source_frame,
+                range(len(source.data.vertices)),
+                camera_contract,
+            )
         for index, (_ordinal, bone) in enumerate(valid_per_deform_rows, 1):
             endpoint_bone, endpoint_policy = _preferred_endpoint_bone(bone, populated)
             face_indices = assignments["faces"][bone.name]
@@ -1840,6 +2040,9 @@ def build_normalized_cluster_assets(
                     for vertex_index in source.data.polygons[face_index].vertices
                 }
             )
+            source_frame = canonical_frame(
+                source, armature, bone, endpoint_bone, vertex_indices
+            )
             prototypes.append(
                 {
                     "index": index,
@@ -1849,8 +2052,11 @@ def build_normalized_cluster_assets(
                     "endpoint_policy": endpoint_policy,
                     "source_bones": [bone.name],
                     "face_indices": face_indices,
-                    "frame": canonical_frame(
-                        source, armature, bone, endpoint_bone, vertex_indices
+                    "frame": camera_aligned_frame(
+                        source,
+                        source_frame,
+                        vertex_indices,
+                        camera_contract,
                     ),
                 }
             )
@@ -1888,12 +2094,18 @@ def build_normalized_cluster_assets(
                 whole_pivot = whole_pivot or _whole_mesh_pivot(
                     source, whole_mesh_pivot_object
                 )
-                frame = pivot_subset_frame(source, whole_pivot, vertex_indices)
+                source_frame = pivot_subset_frame(source, whole_pivot, vertex_indices)
             else:
                 endpoint_name = endpoint_bone.name
-                frame = canonical_frame(
+                source_frame = canonical_frame(
                     source, armature, bone, endpoint_bone, vertex_indices
                 )
+            frame = camera_aligned_frame(
+                source,
+                source_frame,
+                vertex_indices,
+                camera_contract,
+            )
             prototypes.append(
                 {
                     "index": index,
@@ -1910,6 +2122,7 @@ def build_normalized_cluster_assets(
         whole_pivot = whole_pivot or _whole_mesh_pivot(
             source, whole_mesh_pivot_object
         )
+        source_frame = whole_mesh_frame(source, whole_pivot)
         prototypes.append(
             {
                 "index": 1,
@@ -1919,7 +2132,12 @@ def build_normalized_cluster_assets(
                 "endpoint_policy": "validated_asset_root_pivot",
                 "source_bones": [],
                 "face_indices": [polygon.index for polygon in source.data.polygons],
-                "frame": whole_mesh_frame(source, whole_pivot),
+                "frame": camera_aligned_frame(
+                    source,
+                    source_frame,
+                    range(len(source.data.vertices)),
+                    camera_contract,
+                ),
             }
         )
 
@@ -2110,6 +2328,12 @@ def build_normalized_cluster_assets(
                     "face_count": len(part.data.polygons),
                     "vertex_count": len(part.data.vertices),
                     "frame_world": _matrix_rows(prototype["frame"]["matrix_world"]),
+                    "source_frame_world": (
+                        _matrix_rows(prototype["frame"]["source_frame_world"])
+                        if prototype["frame"].get("source_frame_world") is not None
+                        else None
+                    ),
+                    "frame_policy": prototype["frame"].get("orientation_policy"),
                     "subpart_to_card_matrix": (
                         _matrix_rows(prototype["subpart_to_card_matrix"])
                         if prototype.get("subpart_to_card_matrix") is not None
@@ -2149,7 +2373,7 @@ def build_normalized_cluster_assets(
                 projection_basis = camera_projection_basis_in_part(
                     card["frame"], camera_uv_bundle["contract"]["camera"]
                 )
-            plan, hull, uv_transfer = _build_plan(
+            plan, hull, uv_transfer, projection_coverage = _build_plan(
                 source,
                 plan_collection,
                 card["plan_name"],
@@ -2208,7 +2432,10 @@ def build_normalized_cluster_assets(
                     "plan_boundary_vertices": len(hull),
                     "plan_interior_vertices": len(plan.data.vertices) - len(hull),
                     "plan_refinement_levels": plan_refinement_levels,
-                    "plan_covers_projection": True,
+                    "plan_covers_projection": bool(
+                        projection_coverage["covers_projection"]
+                    ),
+                    "plan_projection_coverage": projection_coverage,
                     "object_transforms_identity": all(
                         _identity_matrix(obj.matrix_world)
                         for obj in (
@@ -2225,6 +2452,12 @@ def build_normalized_cluster_assets(
                         )
                     ),
                     "frame_world": _matrix_rows(card["frame"]["matrix_world"]),
+                    "source_frame_world": (
+                        _matrix_rows(card["frame"]["source_frame_world"])
+                        if card["frame"].get("source_frame_world") is not None
+                        else None
+                    ),
+                    "frame_policy": card["frame"].get("orientation_policy"),
                     "endpoint_length": card["frame"]["endpoint_length"],
                     "source_world_bounds": card["frame"]["source_world_bounds"],
                     "normalized_bounds": _bounds(coverage_points),
@@ -2271,20 +2504,12 @@ def build_normalized_cluster_assets(
             "unweighted_vertex_count": len(assignments["unweighted_vertices"]),
             "dominant_weight_tie_count": len(assignments["tied_vertices"]),
             "normalization_policy": (
-                "dominant_deform_group_and_start_to_end_parent_child_frame"
-                if resolved_partition_mode == "PER_DEFORM_ROOT"
-                else (
-                    "topology_connected_deform_clusters_with_representative_start_to_end_frame"
-                    if resolved_partition_mode == "PER_CONNECTED_DEFORM_CLUSTER"
-                    else (
-                        "deform_subparts_with_shared_validated_composite_asset_root_frame"
-                        if resolved_partition_mode == "COMPOSITE_PER_DEFORM_ROOT"
-                        else "whole_merged_source_baked_to_validated_asset_root_world_frame"
-                    )
-                )
+                "validated_attachment_origin_with_shared_camera_aligned_rigid_frame"
             ),
             "size_policy": "source_relative_only_no_absolute_dimensions",
-            "plan_policy": "expanded_convex_projection_hull_with_shared_edge_midpoint_refinement",
+            "plan_policy": (
+                "camera_aligned_local_xy_orthogonal_projection_with_pinned_attachment"
+            ),
             "plan_refinement_levels": plan_refinement_levels,
             "plan_uv_policy": "exact_camera_reference_closed_loop_similarity_transfer",
             "camera_reference_collection": camera_reference_collection.name,

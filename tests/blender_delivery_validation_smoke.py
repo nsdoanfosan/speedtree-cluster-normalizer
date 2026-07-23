@@ -94,6 +94,7 @@ def main():
         COMPOSITE_PARTS_KEY,
         COUNTERPART_KEY,
         PROJECTION_BASIS_KEY,
+        PROJECTION_COVERAGE_KEY,
         PROTOTYPE_ASSET_KEY,
         PROTOTYPE_INDEX_KEY,
         SOURCE_PARTITION_MODE_KEY,
@@ -103,6 +104,7 @@ def main():
         UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR,
         UV_TRANSFER_MAX_NORMALIZED_RMS,
         _canonical_sha256,
+        projection_coverage_2d,
     )
 
     camera_spm = asset_dir / "explicit_camera.spm"
@@ -135,8 +137,25 @@ def main():
     planes = []
     plans = []
     references = []
-    vertices = [(-1.0, -0.5, 0.0), (1.0, -0.5, 0.0), (1.0, 0.5, 0.0), (-1.0, 0.5, 0.0)]
-    faces = [(0, 1, 2), (0, 2, 3)]
+    plan_boundary_vertices = [
+        (-1.0, -0.5, 0.0),
+        (1.0, -0.5, 0.0),
+        (1.0, 0.5, 0.0),
+        (-1.0, 0.5, 0.0),
+    ]
+    reference_attachment = (0.25, -0.125)
+    pivot_uv = (0.42, 0.18)
+    reference_vertices = [
+        (
+            vertex[0] + reference_attachment[0],
+            vertex[1] + reference_attachment[1],
+            vertex[2],
+        )
+        for vertex in plan_boundary_vertices
+    ]
+    reference_faces = [(0, 1, 2), (0, 2, 3)]
+    plan_vertices = plan_boundary_vertices + [(0.0, 0.0, 0.0)]
+    plan_faces = [(0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4)]
     for index in range(1, 4):
         plan_name = f"branch_test_{index:02d}"
         skeletal_name = f"SK_branch_test_{index:02d}"
@@ -152,32 +171,45 @@ def main():
             (maximum_u, 0.95),
             (minimum_u, 0.95),
         ]
+        plan_uvs = uvs + [pivot_uv]
         plane = {
             "source_mesh_id": index,
             "source_mesh_name": plan_name + " Cutout",
             "name": plan_name,
-            "vertices": [list(value) for value in vertices],
-            "faces": [list(value) for value in faces],
+            "vertices": [list(value) for value in reference_vertices],
+            "faces": [list(value) for value in reference_faces],
             "uvs": [list(value) for value in uvs],
-            "normals": [[0.0, 0.0, 1.0]] * len(vertices),
+            "normals": [[0.0, 0.0, 1.0]] * len(reference_vertices),
             "attachment": {
-                "source_plane_xy": [0.0, 0.0],
+                "source_plane_xy": list(reference_attachment),
                 "normalized_local": [0.0, 0.0, 0.0],
-                "pivot_uv": [0.5, 0.0],
+                "pivot_uv": list(pivot_uv),
             },
             "topology_sha256": hashlib.sha256((plan_name + " topology").encode()).hexdigest(),
             "uv_sha256": hashlib.sha256((plan_name + " uv").encode()).hexdigest(),
         }
         planes.append(plane)
 
-        reference_mesh = make_mesh(plan_name + "_Reference", vertices, faces, uvs, material)
+        reference_mesh = make_mesh(
+            plan_name + "_Reference",
+            reference_vertices,
+            reference_faces,
+            uvs,
+            material,
+        )
         reference = bpy.data.objects.new("AtlasCameraRef_" + plan_name, reference_mesh)
         reference_collection.objects.link(reference)
         reference.matrix_world = Matrix.Identity(4)
         reference[CAMERA_REFERENCE_KEY] = plan_name
         references.append(reference)
 
-        plan_mesh = make_mesh(plan_name, vertices, faces, uvs, material)
+        plan_mesh = make_mesh(
+            plan_name,
+            plan_vertices,
+            plan_faces,
+            plan_uvs,
+            material,
+        )
         plan = bpy.data.objects.new(plan_name, plan_mesh)
         plan_collection.objects.link(plan)
         plan.matrix_world = Matrix.Identity(4)
@@ -243,7 +275,7 @@ def main():
         plan.data[CAMERA_CONTRACT_HASH_KEY] = contract_hash
         stored_uvs = actual_vertex_uvs(plan.data)
         projection_basis = {
-            "policy": "camera_basis_transformed_world_to_canonical_part_local",
+            "policy": "camera_aligned_canonical_local_xy",
             "right": [1.0, 0.0, 0.0],
             "up": [0.0, 1.0, 0.0],
             "normal": [0.0, 0.0, 1.0],
@@ -257,6 +289,15 @@ def main():
         plan[PROTOTYPE_ASSET_KEY] = prototype_asset
         plan[SOURCE_PARTITION_MODE_KEY] = "PER_DEFORM_ROOT"
         plan[PROJECTION_BASIS_KEY] = json.dumps(projection_basis, sort_keys=True)
+        projection_coverage = projection_coverage_2d(
+            [(-0.8, -0.3), (0.8, -0.3), (0.0, 0.3)],
+            [(value[0], value[1]) for value in plan_boundary_vertices],
+        )
+        plan[PROJECTION_COVERAGE_KEY] = json.dumps(
+            projection_coverage,
+            sort_keys=True,
+        )
+        plan["speedtree_cluster_attachment_vertex_index"] = 4
         transfer = {
             "policy": EXPECTED_TRANSFER_POLICY,
             "normalized_rms": 0.01,
@@ -265,12 +306,13 @@ def main():
             "orientation_preserving": True,
             "scale": 1.0,
             "rotation": [[1.0, 0.0], [0.0, 1.0]],
-            "translation": [0.0, 0.0],
+            "translation": list(reference_attachment),
             "candidate_selection_policy": UV_TRANSFER_CANDIDATE_SELECTION_POLICY,
             "attachment_policy": UV_TRANSFER_ATTACHMENT_POLICY,
             "plan_attachment_xy": [0.0, 0.0],
-            "reference_attachment_xy": [0.0, 0.0],
-            "mapped_attachment_xy": [0.0, 0.0],
+            "reference_attachment_xy": list(reference_attachment),
+            "reference_pivot_uv": list(pivot_uv),
+            "mapped_attachment_xy": list(reference_attachment),
             "attachment_origin_error": 0.0,
             "attachment_origin_error_normalized": 0.0,
             "max_attachment_origin_error_normalized": (
@@ -291,6 +333,9 @@ def main():
             "prototype_index": prototype_index,
             "prototype_asset": prototype_asset,
             "source_partition_mode": "PER_DEFORM_ROOT",
+            "plan_refinement_levels": 0,
+            "attachment_vertex_index": 4,
+            "attachment_vertex_uv": list(pivot_uv),
         }
         plan[UV_TRANSFER_KEY] = json.dumps(transfer, sort_keys=True)
 
@@ -395,12 +440,25 @@ def main():
         )
 
     passed = validate()
+    if (
+        planes[0]["attachment"]["source_plane_xy"] != list(reference_attachment)
+        or planes[0]["attachment"]["pivot_uv"] != list(pivot_uv)
+        or passed["planes"][0]["external_uv_validation"]["attachment_vertex_index"]
+        != 4
+    ):
+        raise RuntimeError("Non-zero camera attachment contract was not independently validated")
     failures = {}
 
     plan = plans[0]
     original_uvs = actual_vertex_uvs(plan.data)
     layer = plan.data.uv_layers["UVMap"]
-    legacy_uvs = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+    legacy_uvs = (
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (0.5, 0.5),
+    )
     for polygon in plan.data.polygons:
         for loop_index in polygon.loop_indices:
             vertex_index = plan.data.loops[loop_index].vertex_index
@@ -415,7 +473,122 @@ def main():
             vertex_index = plan.data.loops[loop_index].vertex_index
             layer.data[loop_index].uv = original_uvs[vertex_index]
 
+    original_z = float(plan.data.vertices[0].co.z)
+    plan.data.vertices[0].co.z = 0.1
+    failures["tilted_plan_rejected"] = expect_failure(
+        "plan outside canonical local XY",
+        validate,
+        "canonical local XY",
+    )
+    plan.data.vertices[0].co.z = original_z
+
     original_transfer = json.loads(plan[UV_TRANSFER_KEY])
+    wrong_pivot_uv = [0.55, 0.05]
+    for polygon in plan.data.polygons:
+        for loop_index in polygon.loop_indices:
+            if plan.data.loops[loop_index].vertex_index == 4:
+                layer.data[loop_index].uv = wrong_pivot_uv
+    mutated_pivot_transfer = dict(original_transfer)
+    mutated_result_uvs = actual_vertex_uvs(plan.data)
+    mutated_pivot_transfer["result_uvs"] = mutated_result_uvs
+    mutated_pivot_transfer["result_uv_sha256"] = _canonical_sha256(mutated_result_uvs)
+    mutated_pivot_transfer["attachment_vertex_uv"] = mutated_result_uvs[4]
+    plan[UV_TRANSFER_KEY] = json.dumps(mutated_pivot_transfer, sort_keys=True)
+    failures["unpinned_pivot_uv_rejected"] = expect_failure(
+        "plan attachment UV not pinned to camera pivot",
+        validate,
+        "not pinned",
+    )
+    for polygon in plan.data.polygons:
+        for loop_index in polygon.loop_indices:
+            if plan.data.loops[loop_index].vertex_index == 4:
+                layer.data[loop_index].uv = original_uvs[4]
+    plan[UV_TRANSFER_KEY] = json.dumps(original_transfer, sort_keys=True)
+
+    boundary_vertex_index = 1
+    tampered_boundary_uv = [
+        original_uvs[boundary_vertex_index][0] + 0.05,
+        original_uvs[boundary_vertex_index][1] - 0.025,
+    ]
+    for polygon in plan.data.polygons:
+        for loop_index in polygon.loop_indices:
+            if plan.data.loops[loop_index].vertex_index == boundary_vertex_index:
+                layer.data[loop_index].uv = tampered_boundary_uv
+    contract_tampered_transfer = dict(original_transfer)
+    contract_tampered_uvs = actual_vertex_uvs(plan.data)
+    contract_tampered_transfer["result_uvs"] = contract_tampered_uvs
+    contract_tampered_transfer["result_uv_sha256"] = _canonical_sha256(
+        contract_tampered_uvs
+    )
+    plan[UV_TRANSFER_KEY] = json.dumps(contract_tampered_transfer, sort_keys=True)
+    failures["camera_contract_uv_tamper_rejected"] = expect_failure(
+        "result UV and hash tampered together",
+        validate,
+        "external camera contract",
+    )
+    for polygon in plan.data.polygons:
+        for loop_index in polygon.loop_indices:
+            if plan.data.loops[loop_index].vertex_index == boundary_vertex_index:
+                layer.data[loop_index].uv = original_uvs[boundary_vertex_index]
+    plan[UV_TRANSFER_KEY] = json.dumps(original_transfer, sort_keys=True)
+
+    stale_attachment_uv = dict(original_transfer)
+    stale_attachment_uv["attachment_vertex_uv"] = [
+        pivot_uv[0] + 0.1,
+        pivot_uv[1],
+    ]
+    plan[UV_TRANSFER_KEY] = json.dumps(stale_attachment_uv, sort_keys=True)
+    failures["stored_attachment_uv_rejected"] = expect_failure(
+        "stored attachment vertex UV differs from actual pivot",
+        validate,
+        "not pinned",
+    )
+    plan[UV_TRANSFER_KEY] = json.dumps(original_transfer, sort_keys=True)
+
+    valid_plan_mesh = plan.data
+    non_triangle_mesh = make_mesh(
+        "NonTrianglePlan",
+        plan_vertices,
+        [(0, 1, 2, 4), (0, 4, 2, 3)],
+        [tuple(value) for value in original_uvs],
+        material,
+    )
+    non_triangle_mesh[CAMERA_CONTRACT_HASH_KEY] = contract_hash
+    plan.data = non_triangle_mesh
+    failures["non_triangle_cdt_rejected"] = expect_failure(
+        "non-triangle plan topology",
+        validate,
+        "not all triangles",
+    )
+    plan.data = valid_plan_mesh
+
+    non_manifold_mesh = make_mesh(
+        "NonManifoldPlan",
+        plan_vertices,
+        [(0, 1, 4), (1, 2, 4), (2, 0, 4), (2, 3, 4), (3, 0, 4)],
+        [tuple(value) for value in original_uvs],
+        material,
+    )
+    non_manifold_mesh[CAMERA_CONTRACT_HASH_KEY] = contract_hash
+    plan.data = non_manifold_mesh
+    failures["non_manifold_cdt_rejected"] = expect_failure(
+        "non-manifold plan topology",
+        validate,
+        "non-manifold",
+    )
+    plan.data = valid_plan_mesh
+
+    original_coverage = json.loads(plan[PROJECTION_COVERAGE_KEY])
+    stale_coverage = dict(original_coverage)
+    stale_coverage["outside_point_count"] = 1
+    plan[PROJECTION_COVERAGE_KEY] = json.dumps(stale_coverage, sort_keys=True)
+    failures["stale_projection_coverage_rejected"] = expect_failure(
+        "stale stored projection coverage",
+        validate,
+        "coverage is stale",
+    )
+    plan[PROJECTION_COVERAGE_KEY] = json.dumps(original_coverage, sort_keys=True)
+
     mirrored_transfer = dict(original_transfer)
     mirrored_transfer["determinant"] = -1.0
     mirrored_transfer["orientation_preserving"] = False
@@ -537,6 +710,14 @@ def main():
         transfer["prototype_asset"] = "SK_branch_test_01"
         transfer["source_partition_mode"] = "COMPOSITE_PER_DEFORM_ROOT"
         plan[UV_TRANSFER_KEY] = json.dumps(transfer, sort_keys=True)
+        composite_coverage = projection_coverage_2d(
+            [(-0.8, -0.3), (0.8, -0.3), (0.0, 0.3)] * 3,
+            [(value[0], value[1]) for value in plan_boundary_vertices],
+        )
+        plan[PROJECTION_COVERAGE_KEY] = json.dumps(
+            composite_coverage,
+            sort_keys=True,
+        )
         card_prototype_map["cards"][index - 1].update({
             "prototype_index": 1,
             "prototype_asset": "SK_branch_test_01",
@@ -574,6 +755,20 @@ def main():
     )
     if any(row["composite_subpart_count"] != 3 for row in composite["planes"]):
         raise RuntimeError("Delivery validator lost the 3-card/3-subpart set")
+    for scale in (2.0, 0.5):
+        scaled_parts = json.loads(plans[0][COMPOSITE_PARTS_KEY])
+        for axis in range(3):
+            scaled_parts[0]["subpart_to_card_matrix"][axis][axis] = scale
+        plans[0][COMPOSITE_PARTS_KEY] = json.dumps(scaled_parts, sort_keys=True)
+        failures[f"composite_scale_{scale}_rejected"] = expect_failure(
+            f"uniform composite scale {scale}",
+            lambda: validate(
+                expected_export_names=composite_export,
+                expected_prototype_count=3,
+            ),
+            "scale/shear",
+        )
+        plans[0][COMPOSITE_PARTS_KEY] = json.dumps(composite_parts, sort_keys=True)
     mutated_parts = json.loads(plans[0][COMPOSITE_PARTS_KEY])
     mutated_parts[0]["subpart_to_card_matrix"][0][0] = -1.0
     plans[0][COMPOSITE_PARTS_KEY] = json.dumps(mutated_parts, sort_keys=True)

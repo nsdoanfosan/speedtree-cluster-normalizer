@@ -98,6 +98,10 @@ def main():
     args = parse_args()
     addon_utils.enable("speedtree_cluster_normalizer", default_set=False)
     import speedtree_cluster_normalizer.normalization as normalization
+    from speedtree_cluster_normalizer.delivery_validation import (
+        _validate_external_camera_uv,
+        _vertex_uvs,
+    )
 
     test_dir = Path(__file__).resolve().parent
     if str(test_dir) not in sys.path:
@@ -179,7 +183,7 @@ def main():
         or len(mapping.get("composite_parts") or []) != 12
     ):
         raise RuntimeError("Card/composite mapping contract is incomplete")
-    for variant in report["variants"]:
+    for variant_index, variant in enumerate(report["variants"]):
         plan = bpy.data.objects[variant["plan"]]
         parts = json.loads(plan[normalization.COMPOSITE_PARTS_KEY])
         if len(parts) != 12 or variant["composite_set_id"] != report["composite_set_id"]:
@@ -188,6 +192,25 @@ def main():
             raise RuntimeError("Composite plan has no internal fold/curl vertices")
         if variant["plan_uv_transfer"]["orientation_preserving"] is not True:
             raise RuntimeError("Composite plan UV transfer is mirrored")
+        transfer = variant["plan_uv_transfer"]
+        _validate_external_camera_uv(
+            plan,
+            bundle["contract"]["planes"][variant_index],
+            bundle["contract"]["camera"],
+            _vertex_uvs(
+                plan.data,
+                expected_uvs=transfer["result_uvs"],
+                label=plan.name,
+            ),
+            transfer,
+        )
+        coverage = variant.get("plan_projection_coverage") or {}
+        if (
+            coverage.get("covers_projection") is not True
+            or coverage.get("outside_point_count") != 0
+            or coverage.get("projected_point_count") != len(source.data.vertices)
+        ):
+            raise RuntimeError("Composite plan coverage was not measured from all subparts")
 
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)

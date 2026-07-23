@@ -136,6 +136,12 @@ def create_scene():
 
 def synthetic_camera_bundle(source, normalization, output_path, margin_ratio):
     armature = normalization.find_source_armature(source)
+    camera = {
+        "name": "Synthetic Camera",
+        "right": [1.0, 0.0, 0.0],
+        "up": [0.0, 1.0, 0.0],
+        "plane_normal": [0.0, 0.0, 1.0],
+    }
     weights = normalization._vertex_bone_weights(source, armature)
     assignments = normalization._face_group_assignments(source, weights)
     bones = sorted(
@@ -154,11 +160,20 @@ def synthetic_camera_bundle(source, normalization, output_path, margin_ratio):
             for face_index in face_indices
             for vertex_index in source.data.polygons[face_index].vertices
         })
-        frame = normalization.canonical_frame(source, armature, bone, endpoint, vertex_indices)
+        source_frame = normalization.canonical_frame(
+            source, armature, bone, endpoint, vertex_indices
+        )
+        frame = normalization.camera_aligned_frame(
+            source,
+            source_frame,
+            vertex_indices,
+            camera,
+        )
         transform = frame["matrix_world"].inverted_safe() @ source.matrix_world
         local_points = [transform @ source.data.vertices[vertex_index].co for vertex_index in vertex_indices]
         hull = normalization.expanded_hull(
-            [(float(point.x), float(point.y)) for point in local_points],
+            [(float(point.x), float(point.y)) for point in local_points]
+            + [(0.0, 0.0)],
             margin_ratio,
         )
         minimum_x = min(point[0] for point in hull)
@@ -219,12 +234,7 @@ def synthetic_camera_bundle(source, normalization, output_path, margin_ratio):
         "version": 1,
         "camera_spm": {"path": "synthetic_camera.spm", "sha256": "synthetic"},
         "tree_spm": {"path": "synthetic_tree.spm", "sha256": "synthetic"},
-        "camera": {
-            "name": "Synthetic Camera",
-            "right": [1.0, 0.0, 0.0],
-            "up": [0.0, 1.0, 0.0],
-            "plane_normal": [0.0, 0.0, 1.0],
-        },
+        "camera": camera,
         "material": {
             "id": 8,
             "name": "M_branch_test",
@@ -294,7 +304,10 @@ def assert_attachment_phase_regression(normalization):
             for index in range(1, len(reference_boundary) - 1)
         ],
         "uvs": reference_uvs,
-        "attachment": {"source_plane_xy": [0.0, 0.0]},
+        "attachment": {
+            "source_plane_xy": [0.0, 0.0],
+            "pivot_uv": [0.5, 0.0],
+        },
     }
     transferred, details = normalization._transfer_camera_boundary_uvs(
         plan_boundary,
@@ -306,16 +319,20 @@ def assert_attachment_phase_regression(normalization):
         plan_attachment_xy=(0.0, 0.0),
     )
     if details["candidate_selection_policy"] != (
-        "attachment_origin_gate_then_outline_normalized_rms"
+        normalization.UV_TRANSFER_CANDIDATE_SELECTION_POLICY
     ):
         raise RuntimeError("Attachment-first UV candidate policy is missing")
-    if details["attachment_origin_error_normalized"] > 0.1:
+    if (
+        details["attachment_origin_error"] > 1.0e-10
+        or details["attachment_origin_error_normalized"] > 1.0e-10
+        or max(abs(value) for value in details["translation"]) > 1.0e-10
+    ):
         raise RuntimeError(f"Attachment phase regression escaped its origin: {details}")
     if details["determinant"] <= 0.0 or details["rotation"][0][0] < 0.9:
         raise RuntimeError(f"Attachment phase regression selected a flipped end: {details}")
-    if not 0.18 < details["normalized_rms"] < details["max_normalized_rms"]:
+    if not 0.0 <= details["normalized_rms"] < details["max_normalized_rms"]:
         raise RuntimeError(
-            "Attachment regression no longer proves that semantic origin wins over outline RMS"
+            "Attachment regression exceeded the outline RMS guard"
         )
     if len(transferred) != len(plan_boundary):
         raise RuntimeError("Attachment phase regression lost exact camera UV interpolation")
@@ -325,6 +342,10 @@ def main():
     args = parse_args()
     addon_utils.enable("speedtree_cluster_normalizer", default_set=False)
     import speedtree_cluster_normalizer.normalization as normalization
+    from speedtree_cluster_normalizer.delivery_validation import (
+        _validate_external_camera_uv,
+        _vertex_uvs,
+    )
     build_normalized_cluster_assets = normalization.build_normalized_cluster_assets
     point_in_convex_polygon = normalization.point_in_convex_polygon
     assert_attachment_phase_regression(normalization)
@@ -383,12 +404,56 @@ def main():
             raise RuntimeError(f"UV layer was not preserved: {row}")
         if [attribute.name for attribute in part.data.color_attributes] != ["color"]:
             raise RuntimeError(f"Color attribute was not preserved: {row}")
+        frame_world = Matrix(row["frame_world"])
+        world_geometry_error = max(
+            (
+                frame_world @ part.data.vertices[local_index].co
+                - source.matrix_world
+                @ source.data.vertices[(index - 1) * 8 + local_index].co
+            ).length
+            for local_index in range(8)
+        )
+        if world_geometry_error > 1.0e-5:
+            raise RuntimeError(f"Camera-aligned frame changed 3D world geometry: {row}")
         basis = row["projection_basis"]
         right = Vector(basis["right"])
         up = Vector(basis["up"])
         normal = Vector(basis["normal"])
-        if any(abs(float(vertex.co.dot(normal))) > 1.0e-6 for vertex in plan.data.vertices):
-            raise RuntimeError(f"Plan is not flat in its camera basis: {row}")
+        if (
+            basis.get("policy") != "camera_aligned_canonical_local_xy"
+            or right != Vector((1.0, 0.0, 0.0))
+            or up != Vector((0.0, 1.0, 0.0))
+            or normal != Vector((0.0, 0.0, 1.0))
+            or any(abs(float(vertex.co.z)) > 1.0e-6 for vertex in plan.data.vertices)
+        ):
+            raise RuntimeError(f"Plan is not exact canonical local XY: {row}")
+        if row.get("frame_policy") != normalization.CAMERA_ALIGNED_FRAME_POLICY:
+            raise RuntimeError(f"3D prototype did not use the camera-aligned frame: {row}")
+        if not row.get("source_frame_world"):
+            raise RuntimeError(f"Original bone frame metadata was not preserved: {row}")
+        transfer = row["plan_uv_transfer"]
+        actual_plan_uvs = _vertex_uvs(
+            plan.data,
+            expected_uvs=transfer["result_uvs"],
+            label=plan.name,
+        )
+        _validate_external_camera_uv(
+            plan,
+            camera_uv_bundle["contract"]["planes"][index - 1],
+            camera_uv_bundle["contract"]["camera"],
+            actual_plan_uvs,
+            transfer,
+        )
+        attachment_index = int(transfer["attachment_vertex_index"])
+        attachment_vertex = plan.data.vertices[attachment_index]
+        if attachment_vertex.co.length > 1.0e-8:
+            raise RuntimeError(f"Plan origin is not an explicit CDT vertex: {row}")
+        stored_uvs = transfer["result_uvs"]
+        if max(
+            abs(stored_uvs[attachment_index][axis] - transfer["reference_pivot_uv"][axis])
+            for axis in range(2)
+        ) > 1.0e-7:
+            raise RuntimeError(f"Plan origin UV is not pinned to the camera contract: {row}")
         boundary_indices = normalization._ordered_boundary_indices(
             [tuple(int(value) for value in face.vertices) for face in plan.data.polygons]
         )
@@ -415,6 +480,13 @@ def main():
             raise RuntimeError(f"Plan coverage failed: {row['plan']} {outside[:10]}")
         if row["plan_covers_projection"] is not True:
             raise RuntimeError(f"Coverage contract missing: {row}")
+        coverage = row.get("plan_projection_coverage") or {}
+        if (
+            coverage.get("covers_projection") is not True
+            or coverage.get("outside_point_count") != 0
+            or coverage.get("projected_point_count") != len(part.data.vertices)
+        ):
+            raise RuntimeError(f"Coverage report was not measured from the part: {row}")
 
     second = build_normalized_cluster_assets(
         bpy.context,
@@ -478,6 +550,41 @@ def main():
             raise RuntimeError(f"Transactional rollback did not preserve {name}")
     if any(obj.name.startswith("__STCLUSTER_BACKUP_") for obj in bpy.data.objects):
         raise RuntimeError("Transactional rollback left staged backup objects")
+
+    connected = build_normalized_cluster_assets(
+        bpy.context,
+        source,
+        "branch_test",
+        "SK_branch_test",
+        "Atlas_Branch_Test_Plans",
+        "M_branch_test",
+        plan_margin_ratio=0.015,
+        replace_generated=True,
+        configure_send2ue=False,
+        camera_uv_bundle=camera_uv_bundle,
+        source_partition_mode="PER_CONNECTED_DEFORM_CLUSTER",
+    )
+    if (
+        connected["source_partition_mode"] != "PER_CONNECTED_DEFORM_CLUSTER"
+        or connected["prototype_count"] != 3
+        or snapshot_source(source) != before
+    ):
+        raise RuntimeError("Connected non-composite rebuild contract failed")
+    for index, row in enumerate(connected["variants"], 1):
+        frame_world = Matrix(row["frame_world"])
+        part = bpy.data.objects[row["mesh"]]
+        world_geometry_error = max(
+            (
+                frame_world @ part.data.vertices[local_index].co
+                - source.matrix_world
+                @ source.data.vertices[(index - 1) * 8 + local_index].co
+            ).length
+            for local_index in range(8)
+        )
+        if world_geometry_error > 1.0e-5:
+            raise RuntimeError(
+                f"Connected camera frame changed 3D world geometry: {row}"
+            )
 
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -257,6 +257,67 @@ def _live_contract_matches_persisted(live_contract, persisted_contract):
     )
 
 
+def _validate_adopted_material_map(
+    tree_spm,
+    persisted,
+    map_name,
+    row,
+    current_map,
+    original_map,
+):
+    """Validate one persisted map while accepting SpeedTree's disabled-size rewrite."""
+    expected_size = [str(value) for value in row.get("size") or []]
+    if current_map is None or original_map is None or len(expected_size) != 2:
+        raise ValueError(f"Adopted target material map is missing: {map_name}")
+
+    filename = str(current_map.findtext("TexFilename") or "")
+    original_filename = str(original_map.findtext("TexFilename") or "")
+    expected_filename = str(row.get("stored") or "")
+    resolved_texture = (tree_spm.parent / filename).resolve() if filename else None
+    current_enabled = str(current_map.findtext("TexEnabled") or "").casefold()
+    original_enabled = str(original_map.findtext("TexEnabled") or "").casefold()
+    current_size = [
+        str(current_map.findtext("TexSizeX") or ""),
+        str(current_map.findtext("TexSizeY") or ""),
+    ]
+    size_policy = "exact_contract_size"
+    if current_size != expected_size:
+        if (
+            current_enabled == "false"
+            and original_enabled == "false"
+            and current_size == ["0", "0"]
+        ):
+            size_policy = "disabled_speedtree_zero_size_normalization"
+        else:
+            raise ValueError(f"Adopted target material map contract mismatch: {map_name}")
+
+    if (
+        resolved_texture is None
+        or not resolved_texture.is_file()
+        or filename != expected_filename
+        or filename != original_filename
+        or not _same_path(resolved_texture, row.get("path", ""))
+        or current_enabled != original_enabled
+    ):
+        raise ValueError(f"Adopted target material map contract mismatch: {map_name}")
+
+    expected_hash = row.get("sha256")
+    if map_name == "Color":
+        expected_hash = persisted.get("albedo_sha256")
+    elif map_name == "Opacity":
+        expected_hash = persisted.get("opacity_sha256")
+    if expected_hash and _sha256(resolved_texture) != expected_hash:
+        raise ValueError(f"Adopted target material map content hash mismatch: {map_name}")
+    return {
+        "map_name": map_name,
+        "tex_filename": filename,
+        "tex_enabled": current_enabled,
+        "tex_size": current_size,
+        "size_policy": size_policy,
+        "resolved_texture": str(resolved_texture),
+    }
+
+
 def _validate_adopted_target_spm(
     tree_spm,
     persisted,
@@ -377,32 +438,18 @@ def _validate_adopted_target_spm(
         raise ValueError("Adopted target material dimensions changed from the camera contract.")
     current_maps = {node.attrib.get("Name"): node for node in current_material.findall("Map")}
     original_maps = {node.attrib.get("Name"): node for node in original_material.findall("Map")}
+    validated_maps = []
     for map_name, row in contract_material.get("maps", {}).items():
-        current_map = current_maps.get(map_name)
-        original_map = original_maps.get(map_name)
-        expected_size = [str(value) for value in row.get("size") or []]
-        if current_map is None or len(expected_size) != 2:
-            raise ValueError(f"Adopted target material map is missing: {map_name}")
-        filename = str(current_map.findtext("TexFilename") or "")
-        resolved_texture = (tree_spm.parent / filename).resolve() if filename else None
-        if (
-            resolved_texture is None
-            or not resolved_texture.is_file()
-            or not _same_path(resolved_texture, row.get("path", ""))
-            or [current_map.findtext("TexSizeX"), current_map.findtext("TexSizeY")]
-            != expected_size
-            or original_map is None
-            or str(current_map.findtext("TexEnabled") or "").casefold()
-            != str(original_map.findtext("TexEnabled") or "").casefold()
-        ):
-            raise ValueError(f"Adopted target material map contract mismatch: {map_name}")
-        expected_hash = row.get("sha256")
-        if map_name == "Color":
-            expected_hash = persisted.get("albedo_sha256")
-        elif map_name == "Opacity":
-            expected_hash = persisted.get("opacity_sha256")
-        if expected_hash and _sha256(resolved_texture) != expected_hash:
-            raise ValueError(f"Adopted target material map content hash mismatch: {map_name}")
+        validated_maps.append(
+            _validate_adopted_material_map(
+                tree_spm,
+                persisted,
+                map_name,
+                row,
+                current_maps.get(map_name),
+                original_maps.get(map_name),
+            )
+        )
     current_mesh_ids = {
         positive_int(node.attrib.get("ID")) for node in assets.findall("Mesh")
     }
@@ -442,7 +489,10 @@ def _validate_adopted_target_spm(
         "adopted_material_id": material_id,
         "adopted_generated_mesh_ids": generated_ids,
         "adopted_original_mesh_ids": expected_original_ids,
+        "adopted_material_maps": validated_maps,
     }
+
+
 def resolve_camera_uv_contract(props, output_prefix):
     """Fail-closed preflight for the exact camera-SPM template and reference blend."""
     if not _enable_atlas_addon():

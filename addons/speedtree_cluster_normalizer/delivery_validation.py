@@ -28,6 +28,7 @@ from .normalization import (
     COMPOSITE_PARTS_KEY,
     COUNTERPART_KEY,
     PROJECTION_BASIS_KEY,
+    PROJECTION_COVERAGE_KEY,
     PROTOTYPE_ASSET_KEY,
     PROTOTYPE_INDEX_KEY,
     SOURCE_PARTITION_MODE_KEY,
@@ -37,8 +38,10 @@ from .normalization import (
     UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR,
     UV_TRANSFER_MAX_NORMALIZED_RMS,
     _canonical_sha256,
+    _transfer_camera_boundary_uvs,
+    _uniform_plan_triangulation,
     _ordered_boundary_indices,
-    point_in_convex_polygon,
+    projection_coverage_2d,
 )
 
 
@@ -92,6 +95,7 @@ def _validate_composite_parts(value, label):
         lengths = [column.length for column in columns]
         if (
             min(lengths) <= _TOLERANCE
+            or max(abs(length - 1.0) for length in lengths) > _TOLERANCE
             or max(lengths) - min(lengths) > _TOLERANCE
             or max(
                 abs((columns[first] / lengths[first]).dot(columns[second] / lengths[second]))
@@ -112,6 +116,111 @@ def _validate_composite_parts(value, label):
     if len({row["skeletal_asset_name"] for row in checked}) != len(checked):
         raise ValueError(f"{label} contains duplicate skeletal assets.")
     return checked
+
+
+def _validate_triangle_disk(mesh, label):
+    faces = [tuple(int(value) for value in polygon.vertices) for polygon in mesh.polygons]
+    if not faces or any(len(face) != 3 for face in faces):
+        raise ValueError(f"Plan CDT topology is not all triangles: {label}")
+    edge_counts = {}
+    referenced = set()
+    for face in faces:
+        if len(set(face)) != 3:
+            raise ValueError(f"Plan CDT topology contains a degenerate triangle: {label}")
+        referenced.update(face)
+        for offset, first in enumerate(face):
+            edge = tuple(sorted((first, face[(offset + 1) % 3])))
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+    if referenced != set(range(len(mesh.vertices))):
+        raise ValueError(f"Plan CDT topology contains an unreferenced vertex: {label}")
+    if any(count not in {1, 2} for count in edge_counts.values()):
+        raise ValueError(f"Plan CDT topology is non-manifold: {label}")
+    boundary_indices = _ordered_boundary_indices(faces)
+    if len(mesh.vertices) - len(edge_counts) + len(faces) != 1:
+        raise ValueError(f"Plan CDT topology is not one manifold disk: {label}")
+    return faces, boundary_indices
+
+
+def _validate_external_camera_uv(plan, plane, camera, actual_uvs, transfer):
+    faces, boundary_indices = _validate_triangle_disk(plan.data, plan.name)
+    boundary = [
+        (
+            float(plan.data.vertices[index].co.x),
+            float(plan.data.vertices[index].co.y),
+        )
+        for index in boundary_indices
+    ]
+    external_boundary_uvs, _external_transfer = _transfer_camera_boundary_uvs(
+        boundary,
+        plane,
+        camera,
+        plan_attachment_xy=(0.0, 0.0),
+    )
+    if any(
+        max(
+            abs(actual_uvs[vertex_index][axis] - external_boundary_uvs[offset][axis])
+            for axis in range(2)
+        )
+        > _TOLERANCE
+        for offset, vertex_index in enumerate(boundary_indices)
+    ):
+        raise ValueError(
+            f"Plan boundary UV differs from the external camera contract: {plan.name}"
+        )
+    try:
+        refinement_levels = int(transfer.get("plan_refinement_levels", -1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Plan refinement contract is invalid: {plan.name}") from exc
+    pivot_uv = _finite_vector(
+        (plane.get("attachment") or {}).get("pivot_uv"),
+        2,
+        "camera contract pivot UV",
+    )
+    (
+        expected_vertices,
+        expected_uvs,
+        expected_faces,
+        expected_attachment_index,
+    ) = _uniform_plan_triangulation(
+        boundary,
+        external_boundary_uvs.tolist(),
+        refinement_levels,
+        attachment_point=(0.0, 0.0),
+        attachment_uv=pivot_uv,
+    )
+    if len(expected_vertices) != len(plan.data.vertices):
+        raise ValueError(f"Plan CDT vertex count differs from canonical rebuild: {plan.name}")
+    maximum_vertex_error = max(
+        math.dist(
+            (float(vertex.co.x), float(vertex.co.y)),
+            expected_vertices[index],
+        )
+        for index, vertex in enumerate(plan.data.vertices)
+    )
+    if maximum_vertex_error > _TOLERANCE:
+        raise ValueError(f"Plan CDT vertices differ from canonical rebuild: {plan.name}")
+    canonical_faces = sorted(tuple(sorted(face)) for face in faces)
+    rebuilt_faces = sorted(tuple(sorted(int(value) for value in face)) for face in expected_faces)
+    if canonical_faces != rebuilt_faces:
+        raise ValueError(f"Plan CDT faces differ from canonical rebuild: {plan.name}")
+    if any(
+        max(
+            abs(actual_uvs[index][axis] - expected_uvs[index][axis])
+            for axis in range(2)
+        )
+        > _TOLERANCE
+        for index in range(len(actual_uvs))
+        if index != expected_attachment_index
+    ):
+        raise ValueError(
+            f"Plan interior UV differs from canonical camera-contract interpolation: {plan.name}"
+        )
+    return {
+        "boundary_vertex_count": len(boundary_indices),
+        "triangle_count": len(faces),
+        "attachment_vertex_index": int(expected_attachment_index),
+        "maximum_vertex_error": float(maximum_vertex_error),
+    }
 
 
 def _plan_composite_parts(plan):
@@ -171,6 +280,21 @@ def _validate_attachment_transfer(transfer, plane, camera, plan_name):
         for axis in range(2)
     ) > _TOLERANCE:
         raise ValueError(f"Plan UV transfer reference attachment mismatch: {plan_name}")
+    expected_pivot_uv = _finite_vector(
+        (plane.get("attachment") or {}).get("pivot_uv"),
+        2,
+        "camera contract pivot UV",
+    )
+    stored_pivot_uv = _finite_vector(
+        transfer.get("reference_pivot_uv"),
+        2,
+        "stored camera pivot UV",
+    )
+    if max(
+        abs(stored_pivot_uv[axis] - expected_pivot_uv[axis])
+        for axis in range(2)
+    ) > _UV_TOLERANCE:
+        raise ValueError(f"Plan UV transfer pivot UV mismatch: {plan_name}")
 
     right = Vector(_finite_vector(camera.get("right"), 3, "camera right basis"))
     up = Vector(_finite_vector(camera.get("up"), 3, "camera up basis"))
@@ -242,8 +366,9 @@ def _validate_attachment_transfer(transfer, plane, camera, plan_name):
         or abs(stored_normalized - attachment_error_normalized) > _TOLERANCE
         or abs(stored_maximum - UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR)
         > _TOLERANCE
-        or attachment_error_normalized
-        > UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR + _TOLERANCE
+        or abs(stored_maximum - 0.0) > _TOLERANCE
+        or attachment_error > _TOLERANCE
+        or attachment_error_normalized > _TOLERANCE
     ):
         raise ValueError(f"Plan UV transfer attachment origin is invalid: {plan_name}")
 
@@ -652,6 +777,11 @@ def validate_camera_uv_delivery(
         projection_basis = _json_property(
             plan, PROJECTION_BASIS_KEY, f"projection basis on {plan.name}"
         )
+        stored_projection_coverage = _json_property(
+            plan,
+            PROJECTION_COVERAGE_KEY,
+            f"projection coverage on {plan.name}",
+        )
         plan_composite_parts = _plan_composite_parts(plan)
         mapping_composite_parts = _validate_composite_parts(
             mapping.get("composite_parts") or [],
@@ -726,6 +856,48 @@ def validate_camera_uv_delivery(
         actual_hash = _canonical_sha256(actual_uvs)
         if stored_hash != transfer.get("result_uv_sha256") or actual_hash != stored_hash:
             raise ValueError(f"Plan actual UV hash does not match the stored result: {plan.name}")
+        external_uv_validation = _validate_external_camera_uv(
+            plan,
+            plane,
+            contract.get("camera") or {},
+            actual_uvs,
+            transfer,
+        )
+        attachment_vertex_index = int(transfer.get("attachment_vertex_index", -1))
+        stored_attachment_index = int(
+            plan.get("speedtree_cluster_attachment_vertex_index", -1)
+        )
+        if (
+            attachment_vertex_index < 0
+            or attachment_vertex_index >= len(plan.data.vertices)
+            or stored_attachment_index != attachment_vertex_index
+            or external_uv_validation["attachment_vertex_index"]
+            != attachment_vertex_index
+        ):
+            raise ValueError(f"Plan attachment vertex index is missing or stale: {plan.name}")
+        attachment_vertex = plan.data.vertices[attachment_vertex_index].co
+        if attachment_vertex.length > _TOLERANCE:
+            raise ValueError(f"Plan attachment vertex is not local origin: {plan.name}")
+        pivot_uv = _finite_vector(
+            transfer.get("reference_pivot_uv"), 2, "plan pinned pivot UV"
+        )
+        stored_attachment_uv = _finite_vector(
+            transfer.get("attachment_vertex_uv"),
+            2,
+            "stored attachment vertex UV",
+        )
+        if max(
+            max(
+                abs(actual_uvs[attachment_vertex_index][axis] - pivot_uv[axis]),
+                abs(stored_attachment_uv[axis] - pivot_uv[axis]),
+                abs(
+                    stored_attachment_uv[axis]
+                    - actual_uvs[attachment_vertex_index][axis]
+                ),
+            )
+            for axis in range(2)
+        ) > _UV_TOLERANCE:
+            raise ValueError(f"Plan attachment vertex UV is not pinned: {plan.name}")
         if [slot for slot in plan.data.materials] != [material]:
             raise ValueError(f"Plan does not use exactly {material_name}: {plan.name}")
         if [slot for slot in reference.data.materials] != [material]:
@@ -763,13 +935,19 @@ def validate_camera_uv_delivery(
         right.normalize()
         up.normalize()
         normal.normalize()
+        expected_axes = (
+            Vector((1.0, 0.0, 0.0)),
+            Vector((0.0, 1.0, 0.0)),
+            Vector((0.0, 0.0, 1.0)),
+        )
         if (
-            abs(right.dot(up)) > _TOLERANCE
-            or abs(right.dot(normal)) > _TOLERANCE
-            or abs(up.dot(normal)) > _TOLERANCE
-            or right.cross(up).dot(normal) < 1.0 - _TOLERANCE
+            projection_basis.get("policy") != "camera_aligned_canonical_local_xy"
+            or any(
+                (actual - expected).length > _TOLERANCE
+                for actual, expected in zip((right, up, normal), expected_axes)
+            )
         ):
-            raise ValueError(f"Plan projection basis is not right-handed: {plan.name}")
+            raise ValueError(f"Plan projection basis is not canonical local XY: {plan.name}")
         boundary_indices = _ordered_boundary_indices(
             [tuple(int(value) for value in polygon.vertices) for polygon in plan.data.polygons]
         )
@@ -780,29 +958,44 @@ def validate_camera_uv_delivery(
             )
             for index in boundary_indices
         ]
-        if any(
-            abs(float(vertex.co.dot(normal))) > _TOLERANCE
-            for vertex in plan.data.vertices
-        ):
-            raise ValueError(f"Camera delivery plan is not planar: {plan.name}")
-        spans = [
-            max(point[axis] for point in plan_boundary)
-            - min(point[axis] for point in plan_boundary)
-            for axis in range(2)
-        ]
-        tolerance = max(max(spans), 1.0) ** 2 * 1.0e-7
-        if any(
-            not point_in_convex_polygon(
-                (
-                    float(vertex.dot(right)),
-                    float(vertex.dot(up)),
-                ),
-                plan_boundary,
-                tolerance=tolerance,
+        if any(abs(float(vertex.co.z)) > _TOLERANCE for vertex in plan.data.vertices):
+            raise ValueError(f"Camera delivery plan is not on canonical local XY: {plan.name}")
+        projected_coverage_points = [
+            (
+                float(vertex.dot(right)),
+                float(vertex.dot(up)),
             )
             for vertex in coverage_points
-        ):
+        ]
+        actual_projection_coverage = projection_coverage_2d(
+            projected_coverage_points,
+            plan_boundary,
+        )
+        if not actual_projection_coverage["covers_projection"]:
             raise ValueError(f"Plan no longer covers its normalized part: {plan.name}")
+        for key in (
+            "covers_projection",
+            "projected_point_count",
+            "outside_point_count",
+            "outside_point_indices",
+            "boundary_vertex_count",
+        ):
+            if stored_projection_coverage.get(key) != actual_projection_coverage[key]:
+                raise ValueError(
+                    f"Plan stored projection coverage is stale: {plan.name}"
+                )
+        stored_coverage_tolerance = float(
+            stored_projection_coverage.get("cross_product_tolerance", math.nan)
+        )
+        if (
+            not math.isfinite(stored_coverage_tolerance)
+            or abs(
+                stored_coverage_tolerance
+                - actual_projection_coverage["cross_product_tolerance"]
+            )
+            > _TOLERANCE
+        ):
+            raise ValueError(f"Plan stored projection coverage is stale: {plan.name}")
         rows.append(
             {
                 "plan": plan.name,
@@ -812,6 +1005,8 @@ def validate_camera_uv_delivery(
                 "result_uv_sha256": actual_hash,
                 "normalized_rms": normalized_rms,
                 "composite_subpart_count": len(plan_composite_parts),
+                "projection_coverage": actual_projection_coverage,
+                "external_uv_validation": external_uv_validation,
             }
         )
 
