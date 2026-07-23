@@ -43,6 +43,11 @@ class STCLUSTER_Properties(PropertyGroup):
                 "Build one normalized SK prototype per populated *_N_Start/*_N_End pair",
             ),
             (
+                "PER_CONNECTED_DEFORM_CLUSTER",
+                "Per Connected 3D Cluster",
+                "Merge deform roots that share source topology, then build one normalized SK prototype per complete cluster and require a 1:1 camera-card match",
+            ),
+            (
                 "WHOLE_MESH",
                 "Whole Mesh",
                 "Bake the whole merged source into one SK prototype at the validated asset-root pivot",
@@ -53,7 +58,7 @@ class STCLUSTER_Properties(PropertyGroup):
                 "Build one SK subpart per populated deform root while every camera card references the same composite subpart set",
             ),
         ),
-        default="AUTO",
+        default="PER_CONNECTED_DEFORM_CLUSTER",
     )
     whole_mesh_pivot_object: PointerProperty(
         name="Whole Mesh Pivot",
@@ -111,8 +116,8 @@ class STCLUSTER_Properties(PropertyGroup):
         min=0,
         max=2,
         description=(
-            "Shared-edge midpoint refinement baked into the plan mesh; adds internal "
-            "vertices for SpeedTree fold/curl without changing the camera-authored boundary UV"
+            "Constrained near-uniform interior triangulation for SpeedTree fold/curl; "
+            "keeps the camera-authored boundary UV without fan-like edge concentration"
         ),
     )
     replace_generated: BoolProperty(

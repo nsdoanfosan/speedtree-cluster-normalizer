@@ -9,6 +9,7 @@ import bmesh
 import bpy
 import numpy as np
 from mathutils import Matrix, Vector
+from mathutils.geometry import delaunay_2d_cdt
 
 
 GENERATED_FLAG = "speedtree_cluster_generated"
@@ -94,18 +95,27 @@ def find_source_armature(source):
 
 def _vertex_bone_weights(source, armature):
     bone_names = {bone.name for bone in armature.data.bones}
+    canonical_bone_names = {}
+    for bone_name in bone_names:
+        match = re.search(r"_(\d+)_End$", bone_name, flags=re.IGNORECASE)
+        if match is None:
+            canonical_bone_names[bone_name] = bone_name
+            continue
+        expected = re.sub(r"_End$", "_Start", bone_name, flags=re.IGNORECASE)
+        canonical_bone_names[bone_name] = expected if expected in bone_names else bone_name
     group_names = {
-        group.index: group.name
+        group.index: canonical_bone_names[group.name]
         for group in source.vertex_groups
         if group.name in bone_names
     }
     weights = {}
     for vertex in source.data.vertices:
-        row = {
-            group_names[element.group]: float(element.weight)
-            for element in vertex.groups
-            if element.group in group_names and element.weight > 0.0
-        }
+        row = defaultdict(float)
+        for element in vertex.groups:
+            if element.group not in group_names or element.weight <= 0.0:
+                continue
+            row[group_names[element.group]] += float(element.weight)
+        row = dict(row)
         weights[vertex.index] = row
     return weights
 
@@ -158,22 +168,110 @@ def _face_group_assignments(source, weights):
     }
 
 
+def _connected_deform_clusters(source, assignments, valid_per_deform_rows):
+    """Merge deform roots that participate in one topological mesh component.
+
+    A SpeedTree cluster can use several deform roots inside one complete 3D
+    prototype.  Treating every root as an export part tears that prototype
+    apart.  Faces that meet through a shared source vertex are in the same
+    topology component, so all of their assigned deform roots must belong to
+    one exported cluster.
+    """
+    rows_by_name = {bone.name: (ordinal, bone) for ordinal, bone in valid_per_deform_rows}
+    parent = {name: name for name in rows_by_name}
+
+    def find(name):
+        root = name
+        while parent[root] != root:
+            root = parent[root]
+        while parent[name] != name:
+            following = parent[name]
+            parent[name] = root
+            name = following
+        return root
+
+    def union(first, second):
+        first_root = find(first)
+        second_root = find(second)
+        if first_root == second_root:
+            return
+        first_ordinal = rows_by_name[first_root][0]
+        second_ordinal = rows_by_name[second_root][0]
+        if first_ordinal <= second_ordinal:
+            parent[second_root] = first_root
+        else:
+            parent[first_root] = second_root
+
+    face_bones = {}
+    for bone_name, face_indices in assignments["faces"].items():
+        if bone_name not in rows_by_name:
+            continue
+        for face_index in face_indices:
+            if face_index in face_bones:
+                raise ValueError(f"Face {face_index} has more than one deform assignment.")
+            face_bones[face_index] = bone_name
+    if len(face_bones) != len(source.data.polygons):
+        raise ValueError(
+            "Connected cluster partition requires every source face to resolve to a valid "
+            f"deform root: {len(face_bones)} of {len(source.data.polygons)} faces."
+        )
+
+    bones_by_vertex = defaultdict(set)
+    for polygon in source.data.polygons:
+        bone_name = face_bones[polygon.index]
+        for vertex_index in polygon.vertices:
+            bones_by_vertex[int(vertex_index)].add(bone_name)
+    for bone_names in bones_by_vertex.values():
+        ordered = sorted(bone_names, key=lambda name: rows_by_name[name][0])
+        for bone_name in ordered[1:]:
+            union(ordered[0], bone_name)
+
+    grouped_names = defaultdict(list)
+    for name in rows_by_name:
+        grouped_names[find(name)].append(name)
+    groups = []
+    for names in grouped_names.values():
+        names.sort(key=lambda name: rows_by_name[name][0])
+        representative_name = names[0]
+        face_indices = sorted(
+            face_index
+            for name in names
+            for face_index in assignments["faces"][name]
+        )
+        groups.append(
+            {
+                "ordinal": rows_by_name[representative_name][0],
+                "representative_bone": rows_by_name[representative_name][1],
+                "bone_names": names,
+                "face_indices": face_indices,
+            }
+        )
+    groups.sort(key=lambda item: item["ordinal"])
+    covered_faces = [face_index for group in groups for face_index in group["face_indices"]]
+    if sorted(covered_faces) != list(range(len(source.data.polygons))):
+        raise ValueError("Connected cluster partition lost or duplicated source faces.")
+    return groups
+
+
 def _preferred_endpoint_bone(bone, populated_bones):
     if bone.name.casefold().endswith("_start"):
         expected = bone.name[:-6] + "_End"
         for child in bone.children:
             if child.name.casefold() == expected.casefold():
                 return child, "matching_end_child"
+    if bone.name.casefold().endswith("_end") and bone.parent is None:
+        return None, "orphan_end_uses_validated_asset_root_pivot"
     raise ValueError(
-        f"Populated deform bone '{bone.name}' must have a direct matching *_End child."
+        f"Populated deform bone '{bone.name}' must have a direct matching *_End child, "
+        "or be an orphan root *_End handled by a validated asset pivot."
     )
 
 
 def _explicit_start_bone_ordinal(bone_name):
-    match = re.search(r"_(\d+)_Start$", str(bone_name), flags=re.IGNORECASE)
+    match = re.search(r"_(\d+)_(?:Start|End)$", str(bone_name), flags=re.IGNORECASE)
     if match is None:
         raise ValueError(
-            f"Populated deform bone '{bone_name}' needs an explicit *_N_Start ordinal."
+            f"Populated deform bone '{bone_name}' needs an explicit *_N_Start or orphan *_N_End ordinal."
         )
     ordinal = int(match.group(1))
     if ordinal < 1:
@@ -330,6 +428,29 @@ def whole_mesh_frame(source, pivot):
         "endpoint_length": float(endpoint_length),
         "source_world_bounds": _bounds(
             [source.matrix_world @ vertex.co for vertex in source.data.vertices]
+        ),
+        "normalized_bounds": bounds,
+        "pivot_object": pivot.name,
+    }
+
+
+def pivot_subset_frame(source, pivot, vertex_indices):
+    matrix_world = pivot.matrix_world.copy()
+    transform = matrix_world.inverted_safe() @ source.matrix_world
+    local_points = [transform @ source.data.vertices[index].co for index in vertex_indices]
+    bounds = _bounds(local_points)
+    if bounds is None or max(bounds["size"]) <= 0.0:
+        raise ValueError("Pivot-normalized cluster subset has no measurable geometry.")
+    endpoint_length = max(float(bounds["size"][1]), max(bounds["size"]) * 0.05)
+    origin = matrix_world.translation
+    endpoint = matrix_world @ Vector((0.0, endpoint_length, 0.0))
+    return {
+        "matrix_world": matrix_world,
+        "origin_world": [float(value) for value in origin],
+        "endpoint_world": [float(value) for value in endpoint],
+        "endpoint_length": float(endpoint_length),
+        "source_world_bounds": _bounds(
+            [source.matrix_world @ source.data.vertices[index].co for index in vertex_indices]
         ),
         "normalized_bounds": bounds,
         "pivot_object": pivot.name,
@@ -1066,6 +1187,174 @@ def _triangulate_uv_boundary(uvs):
     return triangles
 
 
+def _point_segment_parameter(point, first, second):
+    direction = second - first
+    length_squared = float(direction.length_squared)
+    if length_squared <= 1.0e-20:
+        return 0.0, float((point - first).length)
+    parameter = max(0.0, min(1.0, float((point - first).dot(direction) / length_squared)))
+    closest = first + direction * parameter
+    return parameter, float((point - closest).length)
+
+
+def _mean_value_boundary_uv(point, boundary, boundary_uvs, tolerance):
+    point = Vector(point)
+    polygon = [Vector(value) for value in boundary]
+    for index, vertex in enumerate(polygon):
+        if (point - vertex).length <= tolerance:
+            return tuple(float(value) for value in boundary_uvs[index])
+    for index, first in enumerate(polygon):
+        second = polygon[(index + 1) % len(polygon)]
+        parameter, distance = _point_segment_parameter(point, first, second)
+        if distance <= tolerance:
+            first_uv = Vector(boundary_uvs[index])
+            second_uv = Vector(boundary_uvs[(index + 1) % len(polygon)])
+            uv = first_uv.lerp(second_uv, parameter)
+            return tuple(float(value) for value in uv)
+
+    vectors = [vertex - point for vertex in polygon]
+    distances = [float(value.length) for value in vectors]
+    weights = []
+    for index, vector in enumerate(vectors):
+        previous = vectors[index - 1]
+        following = vectors[(index + 1) % len(vectors)]
+        previous_angle = math.atan2(
+            abs(float(previous.cross(vector))), float(previous.dot(vector))
+        )
+        following_angle = math.atan2(
+            abs(float(vector.cross(following))), float(vector.dot(following))
+        )
+        weights.append(
+            (math.tan(previous_angle * 0.5) + math.tan(following_angle * 0.5))
+            / distances[index]
+        )
+    total = sum(weights)
+    if not math.isfinite(total) or total <= 1.0e-20:
+        raise ValueError("Cannot interpolate an interior plan UV from its boundary.")
+    uv = Vector((0.0, 0.0))
+    for weight, value in zip(weights, boundary_uvs):
+        uv += Vector(value) * (weight / total)
+    return tuple(float(value) for value in uv)
+
+
+def _uniform_plan_triangulation(boundary, boundary_uvs, refinement_levels):
+    """Build a constrained, near-uniform interior instead of an ear-clipped fan."""
+    levels = int(refinement_levels)
+    if levels < 0 or levels > 2:
+        raise ValueError("Plan refinement levels must be between 0 and 2.")
+    points = [tuple(float(value) for value in row) for row in boundary]
+    uvs = [tuple(float(value) for value in row) for row in boundary_uvs]
+    if _signed_area_2d(points) < 0.0:
+        points.reverse()
+        uvs.reverse()
+    area = abs(_signed_area_2d(points))
+    minimum_x = min(point[0] for point in points)
+    maximum_x = max(point[0] for point in points)
+    minimum_y = min(point[1] for point in points)
+    maximum_y = max(point[1] for point in points)
+    diagonal = math.hypot(maximum_x - minimum_x, maximum_y - minimum_y)
+    if area <= 1.0e-20 or diagonal <= 1.0e-20:
+        raise ValueError("Plan boundary has no measurable area.")
+
+    boundary_points = list(points)
+    if levels > 0:
+        target_triangles = min(
+            128,
+            max(24, len(points) * 2) * (2 ** (levels - 1)),
+        )
+        coordinates = np.asarray(boundary_points, dtype=np.float64)
+        center = coordinates.mean(axis=0)
+        covariance = np.cov(coordinates - center, rowvar=False, bias=True)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        major = eigenvectors[:, int(np.argmax(eigenvalues))]
+        minor = np.array((-major[1], major[0]), dtype=np.float64)
+        projected_major = (coordinates - center) @ major
+        projected_minor = (coordinates - center) @ minor
+        major_min = float(projected_major.min())
+        major_max = float(projected_major.max())
+        minor_min = float(projected_minor.min())
+        minor_max = float(projected_minor.max())
+        major_span = max(major_max - major_min, diagonal * 1.0e-6)
+        minor_span = max(minor_max - minor_min, diagonal * 1.0e-6)
+        # For a triangulated disk F = 2V - B - 2.  Account for the existing
+        # boundary vertices so the requested density is not effectively
+        # doubled on detailed outlines.
+        target_interior = max(
+            4,
+            int(round((target_triangles - len(boundary_points) + 2) * 0.5)),
+        )
+        major_steps = max(
+            1,
+            int(round(math.sqrt(target_interior * major_span / minor_span))),
+        )
+        minor_steps = max(
+            1,
+            int(round(target_interior / major_steps)),
+        )
+        major_steps = min(32, major_steps)
+        minor_steps = min(16, minor_steps)
+        major_spacing = major_span / float(major_steps + 1)
+        minor_spacing = minor_span / float(minor_steps + 1)
+        edge_clearance = min(major_spacing, minor_spacing) * 0.18
+        for major_index in range(1, major_steps + 1):
+            major_value = major_min + major_spacing * major_index
+            minor_offset = 0.25 * minor_spacing if major_index % 2 else 0.0
+            for minor_index in range(1, minor_steps + 1):
+                minor_value = minor_min + minor_spacing * minor_index + minor_offset
+                if minor_value >= minor_max:
+                    continue
+                candidate_array = center + major * major_value + minor * minor_value
+                candidate = (float(candidate_array[0]), float(candidate_array[1]))
+                if not point_in_convex_polygon(
+                    candidate,
+                    boundary_points,
+                    tolerance=diagonal * diagonal * 1.0e-12,
+                ):
+                    continue
+                point_vector = Vector(candidate)
+                minimum_edge_distance = min(
+                    _point_segment_parameter(
+                        point_vector,
+                        Vector(boundary_points[index]),
+                        Vector(boundary_points[(index + 1) % len(boundary_points)]),
+                    )[1]
+                    for index in range(len(boundary_points))
+                )
+                if minimum_edge_distance >= edge_clearance:
+                    points.append(candidate)
+        if len(points) == len(boundary_points):
+            centroid = tuple(float(value) for value in center)
+            if point_in_convex_polygon(centroid, boundary_points):
+                points.append(centroid)
+
+    boundary_count = len(boundary)
+    edges = [
+        (index, (index + 1) % boundary_count)
+        for index in range(boundary_count)
+    ]
+    cdt_vertices, _cdt_edges, cdt_faces, _orig_v, _orig_e, _orig_f = delaunay_2d_cdt(
+        [Vector(value) for value in points],
+        edges,
+        [tuple(range(boundary_count))],
+        1,
+        diagonal * 1.0e-10,
+        False,
+    )
+    faces = [tuple(int(value) for value in face) for face in cdt_faces]
+    if not faces or any(len(face) != 3 for face in faces):
+        raise ValueError("Constrained plan triangulation did not return triangles.")
+    tolerance = diagonal * 1.0e-8
+    result_uvs = [
+        _mean_value_boundary_uv(vertex, boundary, boundary_uvs, tolerance)
+        for vertex in cdt_vertices
+    ]
+    return (
+        [tuple(float(value) for value in vertex) for vertex in cdt_vertices],
+        result_uvs,
+        faces,
+    )
+
+
 def _refine_plan_triangles(vertices, uvs, faces, levels):
     levels = int(levels)
     if levels < 0 or levels > 2:
@@ -1260,18 +1549,20 @@ def _build_plan(
         uv_bundle["contract"]["camera"],
         plan_attachment_xy=(0.0, 0.0),
     )
+    boundary_uvs = transferred_uvs.tolist()
+    triangulated_points, refined_uvs, faces = _uniform_plan_triangulation(
+        hull,
+        boundary_uvs,
+        plan_refinement_levels,
+    )
     boundary_vertices = [
         tuple(right * point[0] + up * point[1])
         for point in hull
     ]
-    boundary_uvs = transferred_uvs.tolist()
-    boundary_faces = _triangulate_uv_boundary(boundary_uvs)
-    vertices, refined_uvs, faces = _refine_plan_triangles(
-        boundary_vertices,
-        boundary_uvs,
-        boundary_faces,
-        plan_refinement_levels,
-    )
+    vertices = [
+        tuple(right * point[0] + up * point[1])
+        for point in triangulated_points
+    ]
     mesh = bpy.data.meshes.new(plan_name + "_Mesh")
     journal["meshes"].append(mesh)
     mesh.from_pydata(vertices, [], faces)
@@ -1414,6 +1705,7 @@ def build_normalized_cluster_assets(
     if source_partition_mode not in {
         "AUTO",
         "PER_DEFORM_ROOT",
+        "PER_CONNECTED_DEFORM_CLUSTER",
         "WHOLE_MESH",
         "COMPOSITE_PER_DEFORM_ROOT",
     }:
@@ -1514,6 +1806,12 @@ def build_normalized_cluster_assets(
                 ) from exc
             resolved_partition_mode = "WHOLE_MESH"
 
+    connected_deform_groups = []
+    if valid_per_deform_rows:
+        connected_deform_groups = _connected_deform_clusters(
+            source, assignments, valid_per_deform_rows
+        )
+
     prototypes = []
     if resolved_partition_mode in {
         "PER_DEFORM_ROOT",
@@ -1549,6 +1847,7 @@ def build_normalized_cluster_assets(
                     "bone_name": bone.name,
                     "endpoint_name": endpoint_bone.name,
                     "endpoint_policy": endpoint_policy,
+                    "source_bones": [bone.name],
                     "face_indices": face_indices,
                     "frame": canonical_frame(
                         source, armature, bone, endpoint_bone, vertex_indices
@@ -1561,6 +1860,52 @@ def build_normalized_cluster_assets(
                     composite_frame["matrix_world"].inverted_safe()
                     @ prototype["frame"]["matrix_world"]
                 )
+    elif resolved_partition_mode == "PER_CONNECTED_DEFORM_CLUSTER":
+        if not valid_per_deform_rows:
+            raise ValueError(per_deform_error or "Invalid connected deform cluster contract.")
+        if len(connected_deform_groups) != len(reference_planes):
+            summary = [group["bone_names"] for group in connected_deform_groups]
+            raise ValueError(
+                "PER_CONNECTED_DEFORM_CLUSTER requires one complete topology cluster "
+                "per camera card: "
+                f"{len(reference_planes)} cards vs {len(connected_deform_groups)} clusters; "
+                f"groups={summary}."
+            )
+        for index, group in enumerate(connected_deform_groups, 1):
+            bone = group["representative_bone"]
+            endpoint_bone, endpoint_policy = _preferred_endpoint_bone(bone, populated)
+            face_indices = group["face_indices"]
+            vertex_indices = sorted(
+                {
+                    vertex_index
+                    for face_index in face_indices
+                    for vertex_index in source.data.polygons[face_index].vertices
+                }
+            )
+            frame = None
+            endpoint_name = ""
+            if endpoint_bone is None:
+                whole_pivot = whole_pivot or _whole_mesh_pivot(
+                    source, whole_mesh_pivot_object
+                )
+                frame = pivot_subset_frame(source, whole_pivot, vertex_indices)
+            else:
+                endpoint_name = endpoint_bone.name
+                frame = canonical_frame(
+                    source, armature, bone, endpoint_bone, vertex_indices
+                )
+            prototypes.append(
+                {
+                    "index": index,
+                    "asset_name": f"{skeletal_base_name}_{index:02d}",
+                    "bone_name": bone.name,
+                    "endpoint_name": endpoint_name,
+                    "endpoint_policy": "connected_deform_cluster_" + endpoint_policy,
+                    "source_bones": list(group["bone_names"]),
+                    "face_indices": face_indices,
+                    "frame": frame,
+                }
+            )
     else:
         whole_pivot = whole_pivot or _whole_mesh_pivot(
             source, whole_mesh_pivot_object
@@ -1572,6 +1917,7 @@ def build_normalized_cluster_assets(
                 "bone_name": "",
                 "endpoint_name": "",
                 "endpoint_policy": "validated_asset_root_pivot",
+                "source_bones": [],
                 "face_indices": [polygon.index for polygon in source.data.polygons],
                 "frame": whole_mesh_frame(source, whole_pivot),
             }
@@ -1597,7 +1943,12 @@ def build_normalized_cluster_assets(
 
     cards = []
     for index, plane in enumerate(reference_planes, 1):
-        prototype_index = index if resolved_partition_mode == "PER_DEFORM_ROOT" else 1
+        prototype_index = (
+            index
+            if resolved_partition_mode
+            in {"PER_DEFORM_ROOT", "PER_CONNECTED_DEFORM_CLUSTER"}
+            else 1
+        )
         prototype = prototypes[prototype_index - 1]
         cards.append(
             {
@@ -1645,6 +1996,21 @@ def build_normalized_cluster_assets(
     if len(desired_names) != len(set(desired_names)):
         raise ValueError("Canonical output names are not unique.")
     conflicts = [name for name in desired_names if bpy.data.objects.get(name) is not None]
+    # A rebuild can legitimately reduce the prototype count (for example when
+    # several deform roots are recognized as one complete topology cluster).
+    # Stage prior generated outputs from the same canonical asset family as
+    # stale data so they are removed at commit instead of being preserved as
+    # misleading Export/reference objects.
+    stale_generated = [
+        obj.name
+        for obj in bpy.data.objects
+        if _is_generated(obj)
+        and str(obj.get(PROTOTYPE_ASSET_KEY) or "").startswith(
+            skeletal_base_name + "_"
+        )
+        and obj.name not in desired_names
+    ]
+    conflicts = list(dict.fromkeys(conflicts + stale_generated))
     if conflicts and not replace_generated:
         raise ValueError("Output objects already exist: " + ", ".join(conflicts))
     backups = _stage_named_generated_objects(conflicts) if conflicts else []
@@ -1738,6 +2104,7 @@ def build_normalized_cluster_assets(
                     "mesh": part.name,
                     "cards": card_names,
                     "source_bone": prototype["bone_name"] or None,
+                    "source_bones": list(prototype.get("source_bones") or []),
                     "endpoint_bone": prototype["endpoint_name"] or None,
                     "endpoint_policy": prototype["endpoint_policy"],
                     "face_count": len(part.data.polygons),
@@ -1907,9 +2274,13 @@ def build_normalized_cluster_assets(
                 "dominant_deform_group_and_start_to_end_parent_child_frame"
                 if resolved_partition_mode == "PER_DEFORM_ROOT"
                 else (
-                    "deform_subparts_with_shared_validated_composite_asset_root_frame"
-                    if resolved_partition_mode == "COMPOSITE_PER_DEFORM_ROOT"
-                    else "whole_merged_source_baked_to_validated_asset_root_world_frame"
+                    "topology_connected_deform_clusters_with_representative_start_to_end_frame"
+                    if resolved_partition_mode == "PER_CONNECTED_DEFORM_CLUSTER"
+                    else (
+                        "deform_subparts_with_shared_validated_composite_asset_root_frame"
+                        if resolved_partition_mode == "COMPOSITE_PER_DEFORM_ROOT"
+                        else "whole_merged_source_baked_to_validated_asset_root_world_frame"
+                    )
                 )
             ),
             "size_policy": "source_relative_only_no_absolute_dimensions",

@@ -149,6 +149,7 @@ class STCLUSTER_PT_panel(Panel):
             "AUTO",
             "WHOLE_MESH",
             "COMPOSITE_PER_DEFORM_ROOT",
+            "PER_CONNECTED_DEFORM_CLUSTER",
         }:
             layout.prop(props, "whole_mesh_pivot_object")
         names = layout.column(align=True)

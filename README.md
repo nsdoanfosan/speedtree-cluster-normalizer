@@ -59,6 +59,7 @@ addons/speedtree_cluster_normalizer/
 tests/
   blender_atlas_spm_handoff_smoke.py
   blender_composite_side_smoke.py
+  blender_connected_deform_cluster_smoke.py
   blender_cluster_normalization_smoke.py
   blender_cluster_normalization_real_smoke.py
   blender_delivery_validation_smoke.py

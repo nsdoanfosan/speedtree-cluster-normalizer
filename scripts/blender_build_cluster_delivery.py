@@ -32,6 +32,7 @@ def parse_args():
         choices=(
             "AUTO",
             "PER_DEFORM_ROOT",
+            "PER_CONNECTED_DEFORM_CLUSTER",
             "WHOLE_MESH",
             "COMPOSITE_PER_DEFORM_ROOT",
         ),
