@@ -97,20 +97,56 @@ def main():
         PROJECTION_COVERAGE_KEY,
         PROTOTYPE_ASSET_KEY,
         PROTOTYPE_INDEX_KEY,
+        PLAN_ROOT_LOCK_KEY,
+        SOURCE_3D_CONTRACT_HASH_KEY,
+        SOURCE_3D_CONTRACT_KEY,
         SOURCE_PARTITION_MODE_KEY,
         UV_TRANSFER_ATTACHMENT_POLICY,
         UV_TRANSFER_CANDIDATE_SELECTION_POLICY,
         UV_TRANSFER_KEY,
         UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR,
         UV_TRANSFER_MAX_NORMALIZED_RMS,
+        XML_ATTACHMENT_KEY,
         _canonical_sha256,
         projection_coverage_2d,
     )
 
     camera_spm = asset_dir / "explicit_camera.spm"
     tree_spm = asset_dir / "explicit_tree.spm"
+    source_spm = asset_dir / "SK_branch_test.spm"
+    source_fbx = asset_dir / "SK_branch_test.fbx"
+    source_xml = asset_dir / "SK_branch_test.xml"
     camera_spm.write_text("<SpeedTree camera='synthetic'/>", encoding="utf-8")
     tree_spm.write_text("<SpeedTree tree='synthetic'/>", encoding="utf-8")
+    source_spm.write_bytes(b"synthetic-source-spm")
+    source_fbx.write_bytes(b"synthetic-source-fbx")
+    source_xml.write_text(
+        '<SpeedTreeRaw Source="{}"><Bones>{}</Bones></SpeedTreeRaw>'.format(
+            source_spm,
+            "".join(
+                '<Bone ID="{id}" ParentID="-1" StartX="{start}" StartY="0" '
+                'StartZ="0" EndX="{start}" EndY="100" EndZ="0" '
+                'Radius="10" Generator="Synthetic"/>'.format(
+                    id=index - 1,
+                    start=(index - 1) * 1000,
+                )
+                for index in range(1, 4)
+            ),
+        ),
+        encoding="utf-8",
+    )
+    source_3d_contract = {
+        "xml_path": str(source_xml),
+        "xml_sha256": sha256(source_xml),
+        "xml_mtime_ns": int(source_xml.stat().st_mtime_ns),
+        "source_spm": str(source_spm),
+        "source_spm_sha256": sha256(source_spm),
+        "source_fbx": str(source_fbx),
+        "source_fbx_sha256": sha256(source_fbx),
+        "scale": 100.0,
+        "scale_scores": [{"scale": 100.0, "median_nearest_error": 0.0}],
+        "root_ids": [0, 1, 2],
+    }
     color_path = asset_dir / "M_branch_test_Color.png"
     opacity_path = asset_dir / "M_branch_test_Opacity.png"
     color_image = make_file_image(color_path, (0.2, 0.6, 0.1, 1.0))
@@ -137,9 +173,12 @@ def main():
     planes = []
     plans = []
     references = []
+    parts = []
+    attachments = []
+    root_locks = []
     plan_boundary_vertices = [
-        (-1.0, -0.5, 0.0),
-        (1.0, -0.5, 0.0),
+        (-1.0, -0.3, 0.0),
+        (1.0, -0.3, 0.0),
         (1.0, 0.5, 0.0),
         (-1.0, 0.5, 0.0),
     ]
@@ -241,6 +280,45 @@ def main():
         pivot[ASSET_ROLE_KEY] = "send2ue_pivot"
         armature[ASSET_ROLE_KEY] = "skeletal_armature"
         part[ASSET_ROLE_KEY] = "skeletal_mesh"
+        xml_start_world = [(index - 1) * 10.0, 0.0, 0.0]
+        attachment = {
+            "xml_bone_id": index - 1,
+            "xml_parent_id": -1,
+            "xml_start_world": xml_start_world,
+            "xml_end_world": [xml_start_world[0], 1.0, 0.0],
+            "xml_radius_world": 0.1,
+            "xml_generator": "Synthetic",
+            "match_policy": "start_end_or_orphan_end_to_xml_root",
+            "matched_start_bone": f"Bone_{index}_Start",
+            "matched_endpoint_bone": f"Bone_{index}_End",
+            "start_match_error": 0.0,
+            "end_match_error": 0.0,
+            "match_tolerance": 1.0e-6,
+        }
+        root_lock = {
+            "policy": "xml_root_tangent_preserve_unexpanded_projection_support",
+            "root_axis_xy": [0.0, 1.0],
+            "unexpanded_root_support": -0.3,
+            "unexpanded_distal_support": 0.3,
+            "locked_root_support": -0.3,
+            "maximum_root_margin_trim": 0.2,
+            "attachment_xy": [0.0, 0.0],
+            "attachment_inside_unexpanded_projection": True,
+            "tolerance": math.hypot(1.6, 0.6) * 1.0e-7,
+        }
+        part[SOURCE_3D_CONTRACT_KEY] = json.dumps(source_3d_contract, sort_keys=True)
+        part[XML_ATTACHMENT_KEY] = json.dumps(attachment, sort_keys=True)
+        part["speedtree_cluster_frame_world"] = json.dumps(
+            [
+                [1.0, 0.0, 0.0, xml_start_world[0]],
+                [0.0, 1.0, 0.0, xml_start_world[1]],
+                [0.0, 0.0, 1.0, xml_start_world[2]],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        )
+        parts.append(part)
+        attachments.append(attachment)
+        root_locks.append(root_lock)
 
     reference_blend = asset_dir / "exact_camera_reference.blend"
     bpy.data.libraries.write(str(reference_blend), set(references), fake_user=True)
@@ -269,7 +347,9 @@ def main():
     }
     contract_hash = _canonical_sha256(contract)
     reference_hash = sha256(reference_blend)
-    for plane, plan, reference in zip(planes, plans, references):
+    for plane, plan, reference, attachment, root_lock in zip(
+        planes, plans, references, attachments, root_locks
+    ):
         reference[CAMERA_CONTRACT_HASH_KEY] = contract_hash
         plan[CAMERA_CONTRACT_HASH_KEY] = contract_hash
         plan.data[CAMERA_CONTRACT_HASH_KEY] = contract_hash
@@ -288,6 +368,9 @@ def main():
         plan[PROTOTYPE_INDEX_KEY] = prototype_index
         plan[PROTOTYPE_ASSET_KEY] = prototype_asset
         plan[SOURCE_PARTITION_MODE_KEY] = "PER_DEFORM_ROOT"
+        plan[SOURCE_3D_CONTRACT_KEY] = json.dumps(source_3d_contract, sort_keys=True)
+        plan[XML_ATTACHMENT_KEY] = json.dumps(attachment, sort_keys=True)
+        plan[PLAN_ROOT_LOCK_KEY] = json.dumps(root_lock, sort_keys=True)
         plan[PROJECTION_BASIS_KEY] = json.dumps(projection_basis, sort_keys=True)
         projection_coverage = projection_coverage_2d(
             [(-0.8, -0.3), (0.8, -0.3), (0.0, 0.3)],
@@ -318,7 +401,7 @@ def main():
             "max_attachment_origin_error_normalized": (
                 UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR
             ),
-            "reference_extent_diagonal": math.sqrt(5.0),
+            "reference_extent_diagonal": math.hypot(2.0, 0.8),
             "contract_sha256": contract_hash,
             "reference_plane": plane["name"],
             "reference_object": reference.name,
@@ -336,6 +419,9 @@ def main():
             "plan_refinement_levels": 0,
             "attachment_vertex_index": 4,
             "attachment_vertex_uv": list(pivot_uv),
+            "source_3d_contract": source_3d_contract,
+            "xml_attachment": attachment,
+            "plan_root_lock": root_lock,
         }
         plan[UV_TRANSFER_KEY] = json.dumps(transfer, sort_keys=True)
 
@@ -393,12 +479,15 @@ def main():
     scene[CAMERA_CONTRACT_KEY] = json.dumps(contract, sort_keys=True)
     scene[CAMERA_CONTRACT_HASH_KEY] = contract_hash
     scene[CAMERA_BUNDLE_KEY] = json.dumps(bundle, sort_keys=True)
+    scene[SOURCE_3D_CONTRACT_KEY] = json.dumps(source_3d_contract, sort_keys=True)
+    scene[SOURCE_3D_CONTRACT_HASH_KEY] = _canonical_sha256(source_3d_contract)
     card_prototype_map = {
         "version": 1,
         "source_object": "Synthetic",
         "source_partition_mode": "PER_DEFORM_ROOT",
         "card_count": 3,
         "prototype_count": 3,
+        "source_3d_contract_sha256": _canonical_sha256(source_3d_contract),
         "cards": [
             {
                 "card_index": index,
@@ -406,6 +495,7 @@ def main():
                 "source_mesh_id": index,
                 "prototype_index": index,
                 "prototype_asset": f"SK_branch_test_{index:02d}",
+                "xml_bone_id": index - 1,
             }
             for index in range(1, 4)
         ],
@@ -450,6 +540,52 @@ def main():
     failures = {}
 
     plan = plans[0]
+    part = bpy.data.objects["SK_branch_test_01_Mesh"]
+    original_plan_attachment = json.loads(plan[XML_ATTACHMENT_KEY])
+    original_part_attachment = json.loads(part[XML_ATTACHMENT_KEY])
+    original_lineage_transfer = json.loads(plan[UV_TRANSFER_KEY])
+    original_part_frame = json.loads(part["speedtree_cluster_frame_world"])
+    shifted_attachment = json.loads(json.dumps(original_plan_attachment))
+    delta = (1.0, 2.0, 3.0)
+    for key in ("xml_start_world", "xml_end_world"):
+        shifted_attachment[key] = [
+            float(value) + delta[axis]
+            for axis, value in enumerate(shifted_attachment[key])
+        ]
+    shifted_transfer = json.loads(json.dumps(original_lineage_transfer))
+    shifted_transfer["xml_attachment"] = shifted_attachment
+    shifted_frame = json.loads(json.dumps(original_part_frame))
+    for axis in range(3):
+        shifted_frame[axis][3] += delta[axis]
+    plan[XML_ATTACHMENT_KEY] = json.dumps(shifted_attachment, sort_keys=True)
+    part[XML_ATTACHMENT_KEY] = json.dumps(shifted_attachment, sort_keys=True)
+    plan[UV_TRANSFER_KEY] = json.dumps(shifted_transfer, sort_keys=True)
+    part["speedtree_cluster_frame_world"] = json.dumps(shifted_frame)
+    failures["authoritative_xml_attachment_rejected"] = expect_failure(
+        "coordinated attachment/frame offset with unchanged XML",
+        validate,
+        "XML attachment lineage mismatch",
+    )
+    plan[XML_ATTACHMENT_KEY] = json.dumps(original_plan_attachment, sort_keys=True)
+    part[XML_ATTACHMENT_KEY] = json.dumps(original_part_attachment, sort_keys=True)
+    plan[UV_TRANSFER_KEY] = json.dumps(original_lineage_transfer, sort_keys=True)
+    part["speedtree_cluster_frame_world"] = json.dumps(original_part_frame)
+
+    original_root_lock = json.loads(plan[PLAN_ROOT_LOCK_KEY])
+    permissive_root_lock = dict(original_root_lock)
+    permissive_root_lock["tolerance"] = 1.0e9
+    permissive_transfer = json.loads(plan[UV_TRANSFER_KEY])
+    permissive_transfer["plan_root_lock"] = permissive_root_lock
+    plan[PLAN_ROOT_LOCK_KEY] = json.dumps(permissive_root_lock, sort_keys=True)
+    plan[UV_TRANSFER_KEY] = json.dumps(permissive_transfer, sort_keys=True)
+    failures["self_authored_root_tolerance_rejected"] = expect_failure(
+        "self-authored permissive root-lock tolerance",
+        validate,
+        "root support lock",
+    )
+    plan[PLAN_ROOT_LOCK_KEY] = json.dumps(original_root_lock, sort_keys=True)
+    plan[UV_TRANSFER_KEY] = json.dumps(original_lineage_transfer, sort_keys=True)
+
     original_uvs = actual_vertex_uvs(plan.data)
     layer = plan.data.uv_layers["UVMap"]
     legacy_uvs = (
@@ -606,7 +742,7 @@ def main():
     opposite_end_transfer["mapped_attachment_xy"] = [0.0, 1.0]
     opposite_end_transfer["attachment_origin_error"] = 1.0
     opposite_end_transfer["attachment_origin_error_normalized"] = (
-        1.0 / math.sqrt(5.0)
+        1.0 / math.hypot(2.0, 0.8)
     )
     plan[UV_TRANSFER_KEY] = json.dumps(opposite_end_transfer, sort_keys=True)
     failures["opposite_end_attachment_rejected"] = expect_failure(
@@ -674,12 +810,14 @@ def main():
         shared_asset + "_Armature",
         shared_asset + "_Mesh",
     }
-    shared = validate(
-        expected_export_names=shared_export,
-        expected_prototype_count=1,
+    failures["whole_mesh_root_contract_rejected"] = expect_failure(
+        "WHOLE_MESH card sharing under the one-XML-root-per-prototype contract",
+        lambda: validate(
+            expected_export_names=shared_export,
+            expected_prototype_count=1,
+        ),
+        "Card/prototype XML root contract",
     )
-    if shared["card_count"] != 3 or shared["prototype_count"] != 1:
-        raise RuntimeError("Delivery validator lost the 3-card/1-prototype contract")
 
     composite_parts = [
         {
@@ -749,43 +887,17 @@ def main():
         for index in range(1, 4)
         for suffix in ("", "_Armature", "_Mesh")
     }
-    composite = validate(
-        expected_export_names=composite_export,
-        expected_prototype_count=3,
-    )
-    if any(row["composite_subpart_count"] != 3 for row in composite["planes"]):
-        raise RuntimeError("Delivery validator lost the 3-card/3-subpart set")
-    for scale in (2.0, 0.5):
-        scaled_parts = json.loads(plans[0][COMPOSITE_PARTS_KEY])
-        for axis in range(3):
-            scaled_parts[0]["subpart_to_card_matrix"][axis][axis] = scale
-        plans[0][COMPOSITE_PARTS_KEY] = json.dumps(scaled_parts, sort_keys=True)
-        failures[f"composite_scale_{scale}_rejected"] = expect_failure(
-            f"uniform composite scale {scale}",
-            lambda: validate(
-                expected_export_names=composite_export,
-                expected_prototype_count=3,
-            ),
-            "scale/shear",
-        )
-        plans[0][COMPOSITE_PARTS_KEY] = json.dumps(composite_parts, sort_keys=True)
-    mutated_parts = json.loads(plans[0][COMPOSITE_PARTS_KEY])
-    mutated_parts[0]["subpart_to_card_matrix"][0][0] = -1.0
-    plans[0][COMPOSITE_PARTS_KEY] = json.dumps(mutated_parts, sort_keys=True)
-    failures["mirrored_composite_matrix_rejected"] = expect_failure(
-        "mirrored composite relative matrix",
+    failures["composite_physical_root_rejected"] = expect_failure(
+        "composite card frame under the physical XML root contract",
         lambda: validate(
             expected_export_names=composite_export,
             expected_prototype_count=3,
         ),
-        "mirrored",
+        "does not accept a composite card frame",
     )
-    plans[0][COMPOSITE_PARTS_KEY] = json.dumps(composite_parts, sort_keys=True)
     payload = {
         "status": "passed",
         "baseline": passed,
-        "shared_prototype": shared,
-        "composite_prototype": composite,
         "fail_closed": failures,
     }
     output.parent.mkdir(parents=True, exist_ok=True)

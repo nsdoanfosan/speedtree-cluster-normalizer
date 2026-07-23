@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SpeedTree Cluster Normalizer",
     "author": "Codex for PARK",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Cluster Normalize",
     "description": "Normalize skinned SpeedTree cluster parts and build covering plans.",
@@ -14,7 +14,13 @@ import sys
 import bpy
 
 
-_SUBMODULE_NAMES = ("normalization", "props", "atlas_handoff", "operators")
+_SUBMODULE_NAMES = (
+    "attachment_contract",
+    "normalization",
+    "props",
+    "atlas_handoff",
+    "operators",
+)
 
 
 def _load_submodules():

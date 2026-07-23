@@ -98,15 +98,13 @@ def main():
     args = parse_args()
     addon_utils.enable("speedtree_cluster_normalizer", default_set=False)
     import speedtree_cluster_normalizer.normalization as normalization
-    from speedtree_cluster_normalizer.delivery_validation import (
-        _validate_external_camera_uv,
-        _vertex_uvs,
-    )
-
     test_dir = Path(__file__).resolve().parent
     if str(test_dir) not in sys.path:
         sys.path.insert(0, str(test_dir))
-    from blender_cluster_normalization_smoke import box_along_segment
+    from blender_cluster_normalization_smoke import (
+        box_along_segment,
+        synthetic_source_xml,
+    )
     from blender_whole_mesh_side_smoke import side_camera_bundle
 
     source, armature = create_composite_scene(box_along_segment)
@@ -117,105 +115,47 @@ def main():
     armature.parent = pivot
     armature.matrix_world = armature_world
     bundle = side_camera_bundle(source, pivot, normalization, args.output, 0.015)
-
-    report = normalization.build_normalized_cluster_assets(
-        bpy.context,
+    source_xml_path = synthetic_source_xml(
         source,
-        "leaf_elm_side_01",
-        "SK_leaf_composite_01",
-        "Atlas_Composite_Side_Plans",
-        "M_leaf_elm_side_01",
-        plan_margin_ratio=0.015,
-        replace_generated=True,
-        configure_send2ue=False,
-        camera_uv_bundle=bundle,
-        source_partition_mode="COMPOSITE_PER_DEFORM_ROOT",
-        whole_mesh_pivot_object=pivot,
+        args.output,
+        asset_stem="SK_leaf_composite_01",
     )
-    if report["card_count"] != 3 or report["prototype_count"] != 12:
-        raise RuntimeError("Composite side did not produce 3 cards / 12 subparts")
-    if report["source_partition_mode"] != "COMPOSITE_PER_DEFORM_ROOT":
-        raise RuntimeError("Composite partition mode was not retained")
-    if len(report.get("composite_set_id") or "") != 64:
-        raise RuntimeError("Composite set identity was not persisted")
-    expected_assets = {
-        f"SK_leaf_composite_01_{index:02d}" for index in range(1, 13)
-    }
-    actual_assets = {
-        row["skeletal_asset"] for row in report["prototypes"]
-    }
-    if actual_assets != expected_assets:
-        raise RuntimeError("Composite SK subpart names are not consecutive")
-    export_names = {obj.name for obj in bpy.data.collections["Export"].objects}
-    expected_export_names = {
-        asset + suffix
-        for asset in expected_assets
-        for suffix in ("", "_Armature", "_Mesh")
-    }
-    if export_names != expected_export_names:
-        raise RuntimeError("Send to Unreal Export is not exactly 12 subpart hierarchies")
-
-    composite_frame = Matrix(report["composite_frame_world"])
-    source_to_composite = composite_frame.inverted_safe() @ source.matrix_world
-    expected_points = sorted(point_key(source_to_composite @ vertex.co) for vertex in source.data.vertices)
-    reconstructed = []
-    for prototype in report["prototypes"]:
-        relative = Matrix(prototype["subpart_to_card_matrix"])
-        mesh_obj = bpy.data.objects[prototype["mesh"]]
-        reconstructed.extend(
-            point_key(relative @ vertex.co) for vertex in mesh_obj.data.vertices
+    try:
+        normalization.build_normalized_cluster_assets(
+            bpy.context,
+            source,
+            "leaf_elm_side_01",
+            "SK_leaf_composite_01",
+            "Atlas_Composite_Side_Plans",
+            "M_leaf_elm_side_01",
+            plan_margin_ratio=0.015,
+            replace_generated=True,
+            configure_send2ue=False,
+            camera_uv_bundle=bundle,
+            source_partition_mode="COMPOSITE_PER_DEFORM_ROOT",
+            whole_mesh_pivot_object=pivot,
+            source_xml_path=source_xml_path,
         )
-    if sorted(reconstructed) != expected_points:
-        missing = sorted(set(expected_points) - set(reconstructed))[:5]
-        unexpected = sorted(set(reconstructed) - set(expected_points))[:5]
+    except ValueError as exc:
+        rejection = str(exc)
+        expected = "COMPOSITE_PER_DEFORM_ROOT is not supported"
+        if expected not in rejection:
+            raise RuntimeError(f"Unexpected composite rejection: {rejection}") from exc
+    else:
         raise RuntimeError(
-            "Composite relative matrices do not reconstruct source geometry: "
-            f"counts={len(expected_points)}/{len(reconstructed)} "
-            f"missing={missing} unexpected={unexpected}"
+            "Multi-root composite input must fail closed instead of sharing one card frame"
         )
-    if sum(row["face_count"] for row in report["prototypes"]) != len(source.data.polygons):
-        raise RuntimeError("Composite partition lost or duplicated faces")
 
-    mapping = json.loads(bpy.context.scene[normalization.CARD_PROTOTYPE_MAP_KEY])
-    if (
-        mapping.get("version") != 2
-        or mapping.get("prototype_count") != 12
-        or len(mapping.get("composite_parts") or []) != 12
-    ):
-        raise RuntimeError("Card/composite mapping contract is incomplete")
-    for variant_index, variant in enumerate(report["variants"]):
-        plan = bpy.data.objects[variant["plan"]]
-        parts = json.loads(plan[normalization.COMPOSITE_PARTS_KEY])
-        if len(parts) != 12 or variant["composite_set_id"] != report["composite_set_id"]:
-            raise RuntimeError("Plan did not retain the shared composite set")
-        if variant["plan_interior_vertices"] <= 0:
-            raise RuntimeError("Composite plan has no internal fold/curl vertices")
-        if variant["plan_uv_transfer"]["orientation_preserving"] is not True:
-            raise RuntimeError("Composite plan UV transfer is mirrored")
-        transfer = variant["plan_uv_transfer"]
-        _validate_external_camera_uv(
-            plan,
-            bundle["contract"]["planes"][variant_index],
-            bundle["contract"]["camera"],
-            _vertex_uvs(
-                plan.data,
-                expected_uvs=transfer["result_uvs"],
-                label=plan.name,
-            ),
-            transfer,
-        )
-        coverage = variant.get("plan_projection_coverage") or {}
-        if (
-            coverage.get("covers_projection") is not True
-            or coverage.get("outside_point_count") != 0
-            or coverage.get("projected_point_count") != len(source.data.vertices)
-        ):
-            raise RuntimeError("Composite plan coverage was not measured from all subparts")
+    report = {
+        "status": "passed",
+        "source_partition_mode": "COMPOSITE_PER_DEFORM_ROOT",
+        "rejection": rejection,
+    }
 
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("STCLUSTER_COMPOSITE_SIDE_SMOKE=" + str(output))
+    print("STCLUSTER_COMPOSITE_REJECTION_SMOKE=" + str(output))
 
 
 if __name__ == "__main__":

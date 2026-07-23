@@ -29,13 +29,22 @@ class STCLUSTER_Properties(PropertyGroup):
             "define normalized 3D parts and covering plans"
         ),
     )
+    source_xml_path: StringProperty(
+        name="Source 3D XML",
+        subtype="FILE_PATH",
+        default="",
+        description=(
+            "SpeedTree Raw XML exported with the 3D cluster SPM. When empty, the "
+            "explicit XML loaded by SpeedTree Bone Weight Repair is used"
+        ),
+    )
     source_partition_mode: EnumProperty(
         name="Source Partition",
         items=(
             (
                 "AUTO",
                 "Auto",
-                "Use per-deform prototypes only when every populated deform root has an explicit consecutive *_N_Start contract; otherwise require a valid whole-mesh asset pivot",
+                "Use a one-root-per-prototype layout only when every populated deform root has an explicit consecutive *_N_Start contract",
             ),
             (
                 "PER_DEFORM_ROOT",
@@ -47,16 +56,6 @@ class STCLUSTER_Properties(PropertyGroup):
                 "Per Connected 3D Cluster",
                 "Merge deform roots that share source topology, then build one normalized SK prototype per complete cluster and require a 1:1 camera-card match",
             ),
-            (
-                "WHOLE_MESH",
-                "Whole Mesh",
-                "Bake the whole merged source into one SK prototype at the validated asset-root pivot",
-            ),
-            (
-                "COMPOSITE_PER_DEFORM_ROOT",
-                "Composite Per Deform Root",
-                "Build one SK subpart per populated deform root while every camera card references the same composite subpart set",
-            ),
         ),
         default="PER_CONNECTED_DEFORM_CLUSTER",
     )
@@ -64,8 +63,8 @@ class STCLUSTER_Properties(PropertyGroup):
         name="Whole Mesh Pivot",
         type=bpy.types.Object,
         description=(
-            "Optional explicit ancestor whose world matrix is the attachment pivot for "
-            "WHOLE_MESH. When unset, the source's immediate EMPTY parent is required"
+            "Optional explicit ancestor used only to validate WHOLE_MESH hierarchy; "
+            "the physical attachment still comes from Source 3D XML"
         ),
     )
     plan_base_name: StringProperty(

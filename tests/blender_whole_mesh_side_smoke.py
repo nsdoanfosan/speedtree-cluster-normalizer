@@ -26,36 +26,41 @@ def side_camera_bundle(source, pivot, normalization, output_path, margin_ratio):
         "view_direction": [-1.0, 0.0, 0.0],
         "plane_normal": [1.0, 0.0, 0.0],
     }
-    source_frame = normalization.whole_mesh_frame(source, pivot)
-    frame = normalization.camera_aligned_frame(
-        source,
-        source_frame,
-        range(len(source.data.vertices)),
-        camera,
-    )
-    source_to_part = frame["matrix_world"].inverted_safe() @ source.matrix_world
-    local_points = [source_to_part @ vertex.co for vertex in source.data.vertices]
-    hull = normalization.expanded_hull(
-        [(float(point.x), float(point.y)) for point in local_points]
-        + [(0.0, 0.0)],
-        margin_ratio,
-    )
-    minimum_x = min(point[0] for point in hull)
-    maximum_x = max(point[0] for point in hull)
-    minimum_y = min(point[1] for point in hull)
-    maximum_y = max(point[1] for point in hull)
     camera_right = Vector(camera["right"])
     camera_up = Vector(camera["up"])
-    reference_vertices = [
-        list(camera_right * point[0] + camera_up * point[1]) for point in hull
-    ]
-    faces = [(0, offset, offset + 1) for offset in range(1, len(hull) - 1)]
+    armature = normalization.find_source_armature(source)
 
     planes = []
     objects = []
     meshes = []
     material = bpy.data.materials.new("M_leaf_elm_side_01")
     for index in range(1, 4):
+        start = armature.matrix_world @ armature.data.bones[
+            f"Bone_{index}_Start"
+        ].head_local
+        end = armature.matrix_world @ armature.data.bones[
+            f"Bone_{index}_End"
+        ].head_local
+        local_points = []
+        for vertex in source.data.vertices[(index - 1) * 8 : index * 8]:
+            relative = source.matrix_world @ vertex.co - start
+            local_points.append(
+                (float(relative.dot(camera_right)), float(relative.dot(camera_up)))
+            )
+        direction = end - start
+        hull, _root_lock = normalization.root_locked_expanded_hull(
+            local_points + [(0.0, 0.0)],
+            margin_ratio,
+            (direction.dot(camera_right), direction.dot(camera_up)),
+        )
+        minimum_x = min(point[0] for point in hull)
+        maximum_x = max(point[0] for point in hull)
+        minimum_y = min(point[1] for point in hull)
+        maximum_y = max(point[1] for point in hull)
+        reference_vertices = [
+            list(camera_right * point[0] + camera_up * point[1]) for point in hull
+        ]
+        faces = [(0, offset, offset + 1) for offset in range(1, len(hull) - 1)]
         region_min = (index - 1) / 3.0 - (0.001 if index == 1 else 0.0)
         region_max = index / 3.0 + (0.001 if index == 3 else 0.0)
         uvs = [
@@ -66,6 +71,12 @@ def side_camera_bundle(source, pivot, normalization, output_path, margin_ratio):
                 (point[1] - minimum_y) / (maximum_y - minimum_y),
             ]
             for point in hull
+        ]
+        pivot_uv = [
+            region_min
+            + ((0.0 - minimum_x) / (maximum_x - minimum_x))
+            * (region_max - region_min),
+            (0.0 - minimum_y) / (maximum_y - minimum_y),
         ]
         name = f"leaf_elm_side_01_{index:02d}"
         mesh = bpy.data.meshes.new(name + "_ReferenceMesh")
@@ -92,7 +103,7 @@ def side_camera_bundle(source, pivot, normalization, output_path, margin_ratio):
                 "attachment": {
                     "source_plane_xy": [0.0, 0.0],
                     "normalized_local": [0.0, 0.0, 0.0],
-                    "pivot_uv": [0.5, 0.0],
+                    "pivot_uv": pivot_uv,
                 },
                 "topology_sha256": hashlib.sha256(
                     (name + "-topology").encode()
@@ -152,9 +163,14 @@ def main():
     test_dir = Path(__file__).resolve().parent
     if str(test_dir) not in sys.path:
         sys.path.insert(0, str(test_dir))
-    from blender_cluster_normalization_smoke import create_scene
+    from blender_cluster_normalization_smoke import create_scene, synthetic_source_xml
 
     source = create_scene()
+    source_xml_path = synthetic_source_xml(
+        source,
+        args.output,
+        asset_stem="SK_leaf_elm_side_01",
+    )
     armature = normalization.find_source_armature(source)
     pivot = bpy.data.objects.new("SK_leaf_elm_side_01_SourcePivot", None)
     bpy.context.scene.collection.objects.link(pivot)
@@ -178,21 +194,23 @@ def main():
         replace_generated=True,
         configure_send2ue=False,
         camera_uv_bundle=bundle,
-        source_partition_mode="WHOLE_MESH",
+        source_partition_mode="PER_CONNECTED_DEFORM_CLUSTER",
         whole_mesh_pivot_object=pivot,
+        source_xml_path=source_xml_path,
     )
-    if report["card_count"] != 3 or report["prototype_count"] != 1:
+    if report["card_count"] != 3 or report["prototype_count"] != 3:
         raise RuntimeError(f"Side card/prototype counts are wrong: {report}")
-    if report["source_partition_mode"] != "WHOLE_MESH":
-        raise RuntimeError(f"Whole-mesh partition was not retained: {report}")
-    if {row["skeletal_asset"] for row in report["variants"]} != {
-        "SK_leaf_elm_side_01_01"
-    }:
-        raise RuntimeError("Side cards do not share one SK prototype")
+    if report["source_partition_mode"] != "PER_CONNECTED_DEFORM_CLUSTER":
+        raise RuntimeError(f"Connected side partition was not retained: {report}")
+    expected_assets = {
+        f"SK_leaf_elm_side_01_{index:02d}" for index in range(1, 4)
+    }
+    if {row["skeletal_asset"] for row in report["variants"]} != expected_assets:
+        raise RuntimeError("Side cards did not retain one physical XML root per prototype")
     expected_export = {
-        "SK_leaf_elm_side_01_01",
-        "SK_leaf_elm_side_01_01_Armature",
-        "SK_leaf_elm_side_01_01_Mesh",
+        asset + suffix
+        for asset in expected_assets
+        for suffix in ("", "_Armature", "_Mesh")
     }
     actual_export = {obj.name for obj in bpy.data.collections["Export"].objects}
     if actual_export != expected_export:
@@ -204,9 +222,10 @@ def main():
         world_geometry_error = max(
             (
                 frame_world @ part.data.vertices[vertex_index].co
-                - source.matrix_world @ source.data.vertices[vertex_index].co
+                - source.matrix_world
+                @ source.data.vertices[row_index * 8 + vertex_index].co
             ).length
-            for vertex_index in range(len(source.data.vertices))
+            for vertex_index in range(8)
         )
         if world_geometry_error > 1.0e-5:
             raise RuntimeError(f"Side camera frame changed 3D world geometry: {row}")
@@ -248,20 +267,20 @@ def main():
         coverage = row.get("plan_projection_coverage") or {}
         if coverage.get("covers_projection") is not True or coverage.get("outside_point_count") != 0:
             raise RuntimeError(f"Side plan measured coverage failed: {row}")
-        if plan.get(normalization.COUNTERPART_KEY) != "SK_leaf_elm_side_01_01":
+        if plan.get(normalization.COUNTERPART_KEY) != row["skeletal_asset"]:
             raise RuntimeError(f"Side plan counterpart mismatch: {plan.name}")
     for index in range(1, 4):
         reference = bpy.data.objects[f"AtlasCameraRef_leaf_elm_side_01_{index:02d}"]
         if any(abs(float(vertex.co.x)) > 1.0e-6 for vertex in reference.data.vertices):
             raise RuntimeError(f"Synthetic side reference is not on YZ: {reference.name}")
     mapping = json.loads(bpy.context.scene[normalization.CARD_PROTOTYPE_MAP_KEY])
-    if len({row["prototype_asset"] for row in mapping["cards"]}) != 1:
-        raise RuntimeError("Persisted card/prototype mapping lost shared prototype lineage")
+    if len({row["prototype_asset"] for row in mapping["cards"]}) != 3:
+        raise RuntimeError("Persisted card/prototype mapping lost XML root lineage")
 
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("STCLUSTER_WHOLE_SIDE_SMOKE=" + str(output))
+    print("STCLUSTER_CONNECTED_SIDE_SMOKE=" + str(output))
 
 
 if __name__ == "__main__":

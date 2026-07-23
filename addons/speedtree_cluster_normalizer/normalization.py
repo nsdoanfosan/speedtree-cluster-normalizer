@@ -11,6 +11,13 @@ import numpy as np
 from mathutils import Matrix, Vector
 from mathutils.geometry import delaunay_2d_cdt
 
+from .attachment_contract import (
+    load_attachment_contract,
+    match_root_attachment,
+    serialized_attachment,
+    serialized_contract_source,
+)
+
 
 GENERATED_FLAG = "speedtree_cluster_generated"
 LEGACY_GENERATED_FLAG = "atlas_leaf_cluster_generated"
@@ -32,6 +39,10 @@ CAMERA_CONTRACT_KEY = "speedtree_cluster_camera_uv_contract"
 CAMERA_CONTRACT_HASH_KEY = "speedtree_cluster_camera_uv_contract_sha256"
 CAMERA_REFERENCE_KEY = "speedtree_cluster_camera_reference"
 UV_TRANSFER_KEY = "speedtree_cluster_uv_transfer"
+SOURCE_3D_CONTRACT_KEY = "speedtree_cluster_source_3d_contract"
+SOURCE_3D_CONTRACT_HASH_KEY = "speedtree_cluster_source_3d_contract_sha256"
+XML_ATTACHMENT_KEY = "speedtree_cluster_xml_attachment"
+PLAN_ROOT_LOCK_KEY = "speedtree_cluster_plan_root_lock"
 # Camera cutouts and generated covering cards need not share the same outline.
 # Keep this scale-independent guard broad enough for intentionally different
 # side captures while the separate planarity, coverage, orientation, and UV
@@ -298,14 +309,25 @@ def _stable_perpendicular(axis, armature):
     return value.normalized()
 
 
-def canonical_frame(source, armature, bone, endpoint_bone, vertex_indices):
+def canonical_frame(
+    source,
+    armature,
+    bone,
+    endpoint_bone,
+    vertex_indices,
+    attachment=None,
+):
     armature_world = armature.matrix_world
-    origin = armature_world @ bone.head_local
-    endpoint = (
-        armature_world @ endpoint_bone.head_local
-        if endpoint_bone is not None
-        else armature_world @ bone.tail_local
-    )
+    if attachment is None:
+        origin = armature_world @ bone.head_local
+        endpoint = (
+            armature_world @ endpoint_bone.head_local
+            if endpoint_bone is not None
+            else armature_world @ bone.tail_local
+        )
+    else:
+        origin = Vector(attachment["xml_start_world"])
+        endpoint = Vector(attachment["xml_end_world"])
     world_points = [
         source.matrix_world @ source.data.vertices[index].co
         for index in vertex_indices
@@ -362,7 +384,7 @@ def canonical_frame(source, armature, bone, endpoint_bone, vertex_indices):
         frame[row][2] = axis_z[row]
         frame[row][3] = origin[row]
     local_points = [frame.inverted_safe() @ point for point in world_points]
-    return {
+    result = {
         "matrix_world": frame,
         "origin_world": [float(value) for value in origin],
         "endpoint_world": [float(value) for value in endpoint],
@@ -370,6 +392,9 @@ def canonical_frame(source, armature, bone, endpoint_bone, vertex_indices):
         "source_world_bounds": world_bounds,
         "normalized_bounds": _bounds(local_points),
     }
+    if attachment is not None:
+        result["xml_attachment"] = serialized_attachment(attachment)
+    return result
 
 
 def _object_is_ancestor(ancestor, obj):
@@ -501,7 +526,7 @@ def camera_aligned_frame(source, source_frame, vertex_indices, camera):
         raise ValueError("Camera-aligned source subset has no measurable geometry.")
     endpoint_length = max(float(bounds["size"][1]), max(bounds["size"]) * 0.05)
     endpoint = matrix_world @ Vector((0.0, endpoint_length, 0.0))
-    return {
+    result = {
         "matrix_world": matrix_world,
         "origin_world": [float(value) for value in origin],
         "endpoint_world": [float(value) for value in endpoint],
@@ -515,6 +540,9 @@ def camera_aligned_frame(source, source_frame, vertex_indices, camera):
         "source_endpoint_world": list(source_frame.get("endpoint_world") or []),
         "pivot_object": source_frame.get("pivot_object"),
     }
+    if source_frame.get("xml_attachment") is not None:
+        result["xml_attachment"] = dict(source_frame["xml_attachment"])
+    return result
 
 
 def camera_projection_basis_in_part(frame, camera):
@@ -632,6 +660,60 @@ def expanded_hull(points, margin_ratio):
         )
         for point in hull
     ]
+
+
+def root_locked_expanded_hull(points, margin_ratio, root_axis):
+    base_hull = convex_hull_2d(points)
+    axis = Vector((float(root_axis[0]), float(root_axis[1])))
+    if axis.length <= 1.0e-12:
+        raise ValueError("XML root segment collapses in the camera plan plane.")
+    axis.normalize()
+    attachment = (0.0, 0.0)
+    spans = [
+        max(point[index] for point in base_hull)
+        - min(point[index] for point in base_hull)
+        for index in range(2)
+    ]
+    diagonal = math.hypot(*spans)
+    tolerance = max(diagonal * 1.0e-7, 1.0e-9)
+    if not point_in_convex_polygon(attachment, base_hull, tolerance=tolerance):
+        raise ValueError(
+            "XML attachment origin is outside the unexpanded 3D projection hull; "
+            "the XML/root mapping or camera contract is inconsistent."
+        )
+    root_support = min(Vector(point).dot(axis) for point in base_hull)
+    distal_support = max(Vector(point).dot(axis) for point in base_hull)
+    expanded = expanded_hull(base_hull, margin_ratio)
+    locked_points = []
+    maximum_trim = 0.0
+    for point in expanded:
+        value = Vector(point)
+        signed = value.dot(axis)
+        if signed < root_support:
+            maximum_trim = max(maximum_trim, float(root_support - signed))
+            value += axis * (root_support - signed)
+        locked_points.append((float(value.x), float(value.y)))
+    # Clipping only the expanded vertices can move an adjacent support edge
+    # across a sharp root corner.  Retain the complete unexpanded hull in the
+    # final convex set so root locking can never sacrifice source coverage.
+    locked_points.extend(base_hull)
+    hull = convex_hull_2d(locked_points)
+    locked_support = min(Vector(point).dot(axis) for point in hull)
+    if abs(float(locked_support - root_support)) > tolerance:
+        raise ValueError("Plan root support drifted while applying the XML root lock.")
+    if not point_in_convex_polygon(attachment, hull, tolerance=tolerance):
+        raise ValueError("Root-locked plan no longer contains the XML attachment origin.")
+    return hull, {
+        "policy": "xml_root_tangent_preserve_unexpanded_projection_support",
+        "root_axis_xy": [float(axis.x), float(axis.y)],
+        "unexpanded_root_support": float(root_support),
+        "unexpanded_distal_support": float(distal_support),
+        "locked_root_support": float(locked_support),
+        "maximum_root_margin_trim": float(maximum_trim),
+        "attachment_xy": [0.0, 0.0],
+        "attachment_inside_unexpanded_projection": True,
+        "tolerance": float(tolerance),
+    }
 
 
 def point_in_convex_polygon(point, polygon, tolerance=1.0e-7):
@@ -1704,6 +1786,7 @@ def _build_plan(
     prototype_asset,
     source_partition_mode,
     plan_refinement_levels,
+    source_3d_contract,
     journal,
 ):
     right = Vector(projection_basis["right"])
@@ -1721,7 +1804,20 @@ def _build_plan(
         for point in coverage_points
     ]
     attachment_point = (0.0, 0.0)
-    hull = expanded_hull(points + [attachment_point], margin_ratio)
+    xml_attachment = frame.get("xml_attachment")
+    if not isinstance(xml_attachment, dict):
+        raise ValueError("Generated plans require a validated XML physical attachment.")
+    xml_direction_world = Vector(xml_attachment["xml_end_world"]) - Vector(
+        xml_attachment["xml_start_world"]
+    )
+    root_direction_local = (
+        frame["matrix_world"].inverted_safe().to_3x3() @ xml_direction_world
+    )
+    hull, root_lock = root_locked_expanded_hull(
+        points,
+        margin_ratio,
+        (root_direction_local.x, root_direction_local.y),
+    )
     transferred_uvs, transfer = _transfer_camera_boundary_uvs(
         hull,
         reference_plane,
@@ -1791,6 +1887,15 @@ def _build_plan(
     plan[PROJECTION_COVERAGE_KEY] = json.dumps(
         coverage, ensure_ascii=False, sort_keys=True
     )
+    plan[SOURCE_3D_CONTRACT_KEY] = json.dumps(
+        source_3d_contract, ensure_ascii=False, sort_keys=True
+    )
+    plan[XML_ATTACHMENT_KEY] = json.dumps(
+        xml_attachment, ensure_ascii=False, sort_keys=True
+    )
+    plan[PLAN_ROOT_LOCK_KEY] = json.dumps(
+        root_lock, ensure_ascii=False, sort_keys=True
+    )
     transfer.update(
         {
             "reference_plane": reference_plane["name"],
@@ -1811,6 +1916,9 @@ def _build_plan(
             "interior_vertex_count": len(vertices) - len(boundary_vertices),
             "attachment_vertex_index": int(attachment_vertex_index),
             "attachment_vertex_uv": [float(value) for value in pivot_uv],
+            "source_3d_contract": source_3d_contract,
+            "xml_attachment": xml_attachment,
+            "plan_root_lock": root_lock,
         }
     )
     transfer["result_uv_sha256"] = _canonical_sha256(transfer["result_uvs"])
@@ -1825,11 +1933,16 @@ def _build_plan(
     if maximum_plane_error > 1.0e-6:
         raise ValueError(f"Generated plan left its camera projection plane: {plan_name}")
     if not coverage["covers_projection"]:
+        outside_samples = [
+            points[value]
+            for value in coverage["outside_point_indices"][:8]
+        ]
         raise ValueError(
             "Generated plan does not cover "
-            f"{coverage['outside_point_count']} projected vertices: {plan_name}"
+            f"{coverage['outside_point_count']} projected vertices: {plan_name}; "
+            f"samples={outside_samples}; root_lock={root_lock}"
         )
-    return plan, hull, transfer, coverage
+    return plan, hull, transfer, coverage, root_lock
 
 
 def configure_send2ue_handoff(scene):
@@ -1882,6 +1995,7 @@ def build_normalized_cluster_assets(
     source_partition_mode="AUTO",
     whole_mesh_pivot_object=None,
     plan_refinement_levels=1,
+    source_xml_path="",
 ):
     if context.mode != "OBJECT":
         raise ValueError("Cluster normalization must start in Object Mode.")
@@ -1902,6 +2016,11 @@ def build_normalized_cluster_assets(
         "COMPOSITE_PER_DEFORM_ROOT",
     }:
         raise ValueError(f"Unsupported source partition mode: {source_partition_mode}")
+    if source_partition_mode in {"WHOLE_MESH", "COMPOSITE_PER_DEFORM_ROOT"}:
+        raise ValueError(
+            f"{source_partition_mode} is not supported by the XML physical-root "
+            "delivery contract. Use PER_CONNECTED_DEFORM_CLUSTER."
+        )
     if not plan_base_name or not skeletal_base_name:
         raise ValueError("Plan and skeletal base names cannot be empty.")
     if plan_base_name == skeletal_base_name:
@@ -1945,6 +2064,14 @@ def build_normalized_cluster_assets(
         }
     )
     armature = find_source_armature(source)
+    attachment_contract = load_attachment_contract(
+        context.scene,
+        source,
+        armature,
+        explicit_xml_path=source_xml_path,
+    )
+    source_3d_contract = serialized_contract_source(attachment_contract)
+    used_xml_root_ids = set()
     weights = _vertex_bone_weights(source, armature)
     assignments = _face_group_assignments(source, weights)
     populated = {
@@ -1990,15 +2117,17 @@ def build_normalized_cluster_assets(
         if valid_per_deform_rows and len(valid_per_deform_rows) == len(reference_planes):
             resolved_partition_mode = "PER_DEFORM_ROOT"
         else:
-            try:
-                whole_pivot = _whole_mesh_pivot(source, whole_mesh_pivot_object)
-            except ValueError as exc:
-                raise ValueError(
-                    "AUTO could not prove a per-deform or whole-mesh source contract. "
-                    f"Per-deform: {per_deform_error or 'card/prototype count mismatch'}. "
-                    f"Whole-mesh: {exc}"
-                ) from exc
-            resolved_partition_mode = "WHOLE_MESH"
+            raise ValueError(
+                "AUTO could not prove a one-root-per-prototype contract. Use "
+                "PER_CONNECTED_DEFORM_CLUSTER for production cluster data. "
+                f"Per-deform: {per_deform_error or 'card/prototype count mismatch'}."
+            )
+
+    if resolved_partition_mode == "WHOLE_MESH" and len(reference_planes) != 1:
+        raise ValueError(
+            "WHOLE_MESH requires exactly one camera card and one XML physical root. "
+            "Use PER_CONNECTED_DEFORM_CLUSTER for multi-card data."
+        )
 
     connected_deform_groups = []
     if valid_per_deform_rows:
@@ -2022,6 +2151,11 @@ def build_normalized_cluster_assets(
                 f"{len(reference_planes)} cards vs {len(valid_per_deform_rows)} roots."
             )
         if resolved_partition_mode == "COMPOSITE_PER_DEFORM_ROOT":
+            if len(attachment_contract["roots"]) != 1:
+                raise ValueError(
+                    "COMPOSITE_PER_DEFORM_ROOT cannot represent multiple independent XML "
+                    "attachment roots. Use PER_CONNECTED_DEFORM_CLUSTER."
+                )
             whole_pivot = _whole_mesh_pivot(source, whole_mesh_pivot_object)
             composite_source_frame = whole_mesh_frame(source, whole_pivot)
             composite_frame = camera_aligned_frame(
@@ -2040,8 +2174,25 @@ def build_normalized_cluster_assets(
                     for vertex_index in source.data.polygons[face_index].vertices
                 }
             )
+            geometry_bounds = _bounds(
+                [source.matrix_world @ source.data.vertices[value].co for value in vertex_indices]
+            )
+            geometry_scale = max(geometry_bounds["size"])
+            attachment = match_root_attachment(
+                attachment_contract,
+                armature,
+                bone,
+                endpoint_bone,
+                geometry_scale,
+                used_xml_root_ids,
+            )
             source_frame = canonical_frame(
-                source, armature, bone, endpoint_bone, vertex_indices
+                source,
+                armature,
+                bone,
+                endpoint_bone,
+                vertex_indices,
+                attachment=attachment,
             )
             prototypes.append(
                 {
@@ -2052,6 +2203,7 @@ def build_normalized_cluster_assets(
                     "endpoint_policy": endpoint_policy,
                     "source_bones": [bone.name],
                     "face_indices": face_indices,
+                    "xml_attachment": serialized_attachment(attachment),
                     "frame": camera_aligned_frame(
                         source,
                         source_frame,
@@ -2088,18 +2240,27 @@ def build_normalized_cluster_assets(
                     for vertex_index in source.data.polygons[face_index].vertices
                 }
             )
-            frame = None
-            endpoint_name = ""
-            if endpoint_bone is None:
-                whole_pivot = whole_pivot or _whole_mesh_pivot(
-                    source, whole_mesh_pivot_object
-                )
-                source_frame = pivot_subset_frame(source, whole_pivot, vertex_indices)
-            else:
-                endpoint_name = endpoint_bone.name
-                source_frame = canonical_frame(
-                    source, armature, bone, endpoint_bone, vertex_indices
-                )
+            geometry_bounds = _bounds(
+                [source.matrix_world @ source.data.vertices[value].co for value in vertex_indices]
+            )
+            geometry_scale = max(geometry_bounds["size"])
+            attachment = match_root_attachment(
+                attachment_contract,
+                armature,
+                bone,
+                endpoint_bone,
+                geometry_scale,
+                used_xml_root_ids,
+            )
+            endpoint_name = endpoint_bone.name if endpoint_bone is not None else ""
+            source_frame = canonical_frame(
+                source,
+                armature,
+                bone,
+                endpoint_bone,
+                vertex_indices,
+                attachment=attachment,
+            )
             frame = camera_aligned_frame(
                 source,
                 source_frame,
@@ -2115,14 +2276,43 @@ def build_normalized_cluster_assets(
                     "endpoint_policy": "connected_deform_cluster_" + endpoint_policy,
                     "source_bones": list(group["bone_names"]),
                     "face_indices": face_indices,
+                    "xml_attachment": serialized_attachment(attachment),
                     "frame": frame,
                 }
             )
     else:
+        if len(attachment_contract["roots"]) != 1:
+            raise ValueError(
+                "WHOLE_MESH requires exactly one XML structural root; found "
+                f"{len(attachment_contract['roots'])}."
+            )
         whole_pivot = whole_pivot or _whole_mesh_pivot(
             source, whole_mesh_pivot_object
         )
         source_frame = whole_mesh_frame(source, whole_pivot)
+        xml_root = attachment_contract["roots"][0]
+        attachment = {
+            "xml_bone_id": int(xml_root["id"]),
+            "xml_parent_id": int(xml_root["parent_id"]),
+            "xml_generator": xml_root["generator"],
+            "xml_start_world": xml_root["start_world"].copy(),
+            "xml_end_world": xml_root["end_world"].copy(),
+            "xml_radius_world": float(xml_root["radius_world"]),
+            "representative_bone": "",
+            "endpoint_bone": "",
+            "match_policy": "unique_xml_structural_root_whole_mesh",
+            "start_match_error": 0.0,
+            "end_match_error": 0.0,
+            "match_tolerance": 0.0,
+        }
+        source_frame["matrix_world"].translation = xml_root["start_world"]
+        source_frame["origin_world"] = [float(value) for value in xml_root["start_world"]]
+        source_frame["endpoint_world"] = [float(value) for value in xml_root["end_world"]]
+        source_frame["endpoint_length"] = float(
+            (xml_root["end_world"] - xml_root["start_world"]).length
+        )
+        source_frame["xml_attachment"] = serialized_attachment(attachment)
+        used_xml_root_ids.add(xml_root["id"])
         prototypes.append(
             {
                 "index": 1,
@@ -2132,6 +2322,7 @@ def build_normalized_cluster_assets(
                 "endpoint_policy": "validated_asset_root_pivot",
                 "source_bones": [],
                 "face_indices": [polygon.index for polygon in source.data.polygons],
+                "xml_attachment": serialized_attachment(attachment),
                 "frame": camera_aligned_frame(
                     source,
                     source_frame,
@@ -2139,6 +2330,13 @@ def build_normalized_cluster_assets(
                     camera_contract,
                 ),
             }
+        )
+
+    expected_xml_root_ids = {int(root["id"]) for root in attachment_contract["roots"]}
+    if used_xml_root_ids != expected_xml_root_ids:
+        raise ValueError(
+            "Normalized prototypes do not map 1:1 to XML structural roots: "
+            f"used={sorted(used_xml_root_ids)}, expected={sorted(expected_xml_root_ids)}."
         )
 
     composite_parts = []
@@ -2307,6 +2505,14 @@ def build_normalized_cluster_assets(
                 obj[PROTOTYPE_ASSET_KEY] = prototype["asset_name"]
                 obj[SOURCE_PARTITION_MODE_KEY] = resolved_partition_mode
                 obj["speedtree_cluster_prototype_cards"] = json.dumps(card_names)
+                obj[SOURCE_3D_CONTRACT_KEY] = json.dumps(
+                    source_3d_contract, ensure_ascii=False, sort_keys=True
+                )
+                obj[XML_ATTACHMENT_KEY] = json.dumps(
+                    prototype["xml_attachment"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
             built_prototypes[prototype["index"]] = {
                 "pivot": pivot,
                 "armature": part_armature,
@@ -2323,6 +2529,7 @@ def build_normalized_cluster_assets(
                     "cards": card_names,
                     "source_bone": prototype["bone_name"] or None,
                     "source_bones": list(prototype.get("source_bones") or []),
+                    "xml_attachment": prototype["xml_attachment"],
                     "endpoint_bone": prototype["endpoint_name"] or None,
                     "endpoint_policy": prototype["endpoint_policy"],
                     "face_count": len(part.data.polygons),
@@ -2373,7 +2580,7 @@ def build_normalized_cluster_assets(
                 projection_basis = camera_projection_basis_in_part(
                     card["frame"], camera_uv_bundle["contract"]["camera"]
                 )
-            plan, hull, uv_transfer, projection_coverage = _build_plan(
+            plan, hull, uv_transfer, projection_coverage, plan_root_lock = _build_plan(
                 source,
                 plan_collection,
                 card["plan_name"],
@@ -2393,6 +2600,7 @@ def build_normalized_cluster_assets(
                 card["prototype_asset"],
                 resolved_partition_mode,
                 plan_refinement_levels,
+                source_3d_contract,
                 journal,
             )
             if card["composite_parts"]:
@@ -2436,6 +2644,8 @@ def build_normalized_cluster_assets(
                         projection_coverage["covers_projection"]
                     ),
                     "plan_projection_coverage": projection_coverage,
+                    "plan_root_lock": plan_root_lock,
+                    "xml_attachment": card["frame"]["xml_attachment"],
                     "object_transforms_identity": all(
                         _identity_matrix(obj.matrix_world)
                         for obj in (
@@ -2478,6 +2688,7 @@ def build_normalized_cluster_assets(
             "schema_version": 2,
             "source_object": source.name,
             "source_armature": armature.name,
+            "source_3d_contract": source_3d_contract,
             "source_preserved": True,
             "variant_count": len(records),
             "card_count": len(records),
@@ -2535,6 +2746,7 @@ def build_normalized_cluster_assets(
             "source_partition_mode": resolved_partition_mode,
             "card_count": len(records),
             "prototype_count": len(prototype_reports),
+            "source_3d_contract_sha256": _canonical_sha256(source_3d_contract),
             "composite_set_id": composite_set_id,
             "composite_parts": composite_parts,
             "cards": [
@@ -2544,6 +2756,7 @@ def build_normalized_cluster_assets(
                     "source_mesh_id": row["camera_source_mesh_id"],
                     "prototype_index": row["prototype_index"],
                     "prototype_asset": row["prototype_asset"],
+                    "xml_bone_id": row["xml_attachment"]["xml_bone_id"],
                     "composite_set_id": row["composite_set_id"],
                     "composite_parts": row["composite_parts"],
                 }
@@ -2555,6 +2768,12 @@ def build_normalized_cluster_assets(
         )
         context.scene[CARD_PROTOTYPE_MAP_HASH_KEY] = _canonical_sha256(
             card_prototype_map
+        )
+        context.scene[SOURCE_3D_CONTRACT_KEY] = json.dumps(
+            source_3d_contract, ensure_ascii=False, sort_keys=True
+        )
+        context.scene[SOURCE_3D_CONTRACT_HASH_KEY] = _canonical_sha256(
+            source_3d_contract
         )
         persisted_bundle = {
             key: value

@@ -73,6 +73,7 @@ class STCLUSTER_OT_build(Operator):
                 source_partition_mode=props.source_partition_mode,
                 whole_mesh_pivot_object=props.whole_mesh_pivot_object,
                 plan_refinement_levels=props.plan_refinement_levels,
+                source_xml_path=props.source_xml_path,
             )
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
@@ -144,6 +145,7 @@ class STCLUSTER_PT_panel(Panel):
         layout = self.layout
         props = context.scene.speedtree_cluster_normalizer
         layout.prop(props, "source_object")
+        layout.prop(props, "source_xml_path")
         layout.prop(props, "source_partition_mode")
         if props.source_partition_mode in {
             "AUTO",
@@ -175,7 +177,7 @@ class STCLUSTER_PT_panel(Panel):
         atlas.prop(props, "atlas_target_spm")
         atlas.prop(props, "atlas_only_target")
         atlas.prop(props, "atlas_mesh_scale")
-        layout.label(text="Start to End becomes +Y; every output origin is (0,0,0).")
+        layout.label(text="XML root is shared by 3D + plan; every output origin is (0,0,0).")
         layout.operator("speedtree_cluster.build_normalized_assets", icon="MOD_ARMATURE")
         if props.last_report:
             layout.label(text="Last report stored on Scene.")

@@ -23,6 +23,8 @@ It does not export directly to Unreal and does not duplicate the Atlas add-on's 
 
 For each populated deform group, the operator prefers a same-prefix `*_End` child of `*_Start`. The validated Start/pivot attachment remains the origin, while every 3D prototype and its plan share one rigid camera-aligned canonical frame (`camera right`, `camera up`, `camera normal`). The original bone frame is retained as metadata. No rule depends on one example's dimensions.
 
+`Source 3D XML` is the authoritative attachment source. The add-on verifies that the XML, source FBX, and source SPM belong to the same asset, records their SHA-256 hashes and freshness, then reads every structural root whose `ParentID == -1`. XML coordinates are matched against armature bone heads in world space to select the source scale instead of assuming one fixed unit or axis conversion. Each generated part is translated by the exact XML root `Start`, so the physical stem attachment becomes local `(0, 0, 0)`. If an FBX omits a root `*_Start` bone, the corresponding `*_End` head is matched to the XML root `End` only to recover segment identity; the pivot still uses the XML `Start`. Root count and ordinals come from the hierarchy, so the same contract supports branch, leaf, side, and future tree-cluster layouts without elm-specific constants.
+
 Generated Unreal staging hierarchy:
 
 ```text
@@ -36,11 +38,13 @@ The top Empty supplies the asset name through Send to Unreal's `Use Immediate Pa
 
 With `Isolate Generated Export` enabled, objects that were already linked directly to `Export` are preserved in `Cluster_Source_Reference`. This prevents a source rig or an older export from being collected together with the three normalized outputs. The collection move participates in the same rollback transaction as asset generation.
 
-Generated plans such as `branch_elm_01_01` are identity-transform convex projection hulls in `Atlas_Branch_Plans`. Their mesh vertices are always on exact local XY (`Z=0`) in the same canonical space as the normalized 3D counterpart. The margin is a dimensionless ratio. Coverage is measured from every projected counterpart vertex, persisted, and independently recomputed during delivery validation; the plan does not copy an old cutout's point count, area, or absolute dimensions.
+Generated plans such as `branch_elm_01_01` are identity-transform convex projection hulls in `Atlas_Branch_Plans`. Their mesh vertices are always on exact local XY (`Z=0`) in the same canonical space as the normalized 3D counterpart. The margin is a dimensionless ratio. Coverage is measured from every projected counterpart vertex, persisted, and independently recomputed during delivery validation; the plan does not copy an old cutout's point count, area, or absolute dimensions. Margin expansion is locked on the physical root support line: it may expand the outer silhouette, but it cannot grow behind the XML attachment point and recreate the old stem-to-plan offset.
 
 UVs do not use the plan bounding box and are never fitted to opacity pixels. `Camera SPM` and `Camera Name` are explicit inputs; the Color texture stem is not used to guess either one. Before geometry is changed, the operator reads Atlas' public `cluster_card_pipeline.read_uv_template_contract` wrapper from that camera SPM and the explicit tree SPM, then proves the selected Color map is the material contract's Color path. It verifies the camera/material/Cutout payload against the normalization manifest and the validated reference `.blend` hash. Exact reference objects are appended into `Atlas_Camera_Reference`, outside both `Export` and the plan collection. A NumPy closed-loop similarity fit maps each new normalized outline to its corresponding exact camera boundary with the normalized attachment origin constrained exactly to the camera contract's `source_plane_xy`. The origin is forced as a CDT vertex and its UV is pinned to the contract's `pivot_uv`; all other boundary/interior UVs are transferred without clamping the source overscan. Delivery validation independently repeats the camera-boundary transfer and deterministic CDT rebuild from the external contract, rejects non-triangle/non-manifold cards, and does not accept a modified `result_uvs` payload merely because its stored hash was updated too.
 
 Variant pairing is also explicit. Every populated deform bone must end in `*_N_Start`, have its direct matching `*_N_End` child, and use unique consecutive ordinals `1..N`. Those ordinals must match the camera plane suffixes (`_01`, `_02`, ...); missing or ambiguous numbers stop the build instead of guessing a zip order.
+
+Production delivery uses one physical XML root per normalized prototype (`PER_CONNECTED_DEFORM_CLUSTER`, or the equivalent proven per-root layout). Legacy whole-mesh and composite shared-frame requests fail closed because they cannot preserve independent attachment roots without introducing a second pivot convention.
 
 The full contract and all relevant camera/reference/Color/Opacity hashes are persisted on the Scene and generated plans. This is also the supported rebuild path after Atlas adopts the source material and deletes the old embedded cutout IDs: the saved contract is reused only when every independent camera/reference/texture hash still validates. Missing or stale camera evidence cancels the operator before normalized geometry is built. Persisted-map validation accepts SpeedTree's `0 x 0` size rewrite only when both the current and snapshotted map are disabled; enabled maps, including active Color/Opacity, must retain the exact contract size, filename, path, and content hash.
 
@@ -51,6 +55,7 @@ After the camera contract preflight and geometry transaction, the add-on calls A
 ```text
 addons/speedtree_cluster_normalizer/
   __init__.py
+  attachment_contract.py
   atlas_handoff.py
   delivery_validation.py
   normalization.py
@@ -61,6 +66,7 @@ tests/
   blender_composite_side_smoke.py
   blender_connected_deform_cluster_smoke.py
   blender_cluster_normalization_smoke.py
+  blender_xml_attachment_root_lock_smoke.py
   blender_cluster_normalization_real_smoke.py
   blender_delivery_validation_smoke.py
   blender_delivery_validation_real_smoke.py

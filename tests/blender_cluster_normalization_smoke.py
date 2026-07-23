@@ -134,6 +134,50 @@ def create_scene():
     return source
 
 
+def synthetic_source_xml(source, output_path, asset_stem="SK_branch_test"):
+    root = Path(output_path).resolve().parent / "synthetic_source_3d"
+    root.mkdir(parents=True, exist_ok=True)
+    spm = root / f"{asset_stem}.spm"
+    fbx = root / f"{asset_stem}.fbx"
+    xml = root / f"{asset_stem}.xml"
+    spm.write_bytes(b"synthetic-source-spm")
+    fbx.write_bytes(b"synthetic-source-fbx")
+    armature = source.find_armature()
+    rows = []
+    start_bones = sorted(
+        (bone for bone in armature.data.bones if bone.name.endswith("_Start")),
+        key=lambda bone: int(bone.name.split("_")[1]),
+    )
+    for index, start_bone in enumerate(start_bones, 1):
+        endpoint_bone = armature.data.bones.get(start_bone.name[:-6] + "_End")
+        if endpoint_bone is None:
+            raise RuntimeError(f"Synthetic source root lacks endpoint: {start_bone.name}")
+        start = armature.matrix_world @ start_bone.head_local
+        end = armature.matrix_world @ armature.data.bones[
+            endpoint_bone.name
+        ].head_local
+        rows.append(
+            '<Bone ID="{id}" ParentID="-1" StartX="{sx:.12g}" '
+            'StartY="{sy:.12g}" StartZ="{sz:.12g}" EndX="{ex:.12g}" '
+            'EndY="{ey:.12g}" EndZ="{ez:.12g}" Radius="10" '
+            'Generator="Synthetic"/>'.format(
+                id=index - 1,
+                sx=start.x * 100.0,
+                sy=start.y * 100.0,
+                sz=start.z * 100.0,
+                ex=end.x * 100.0,
+                ey=end.y * 100.0,
+                ez=end.z * 100.0,
+            )
+        )
+    xml.write_text(
+        f'<SpeedTreeRaw Source="{spm}"><Bones>{"".join(rows)}</Bones></SpeedTreeRaw>',
+        encoding="utf-8",
+    )
+    source["codex_source_fbx"] = str(fbx)
+    return str(xml)
+
+
 def synthetic_camera_bundle(source, normalization, output_path, margin_ratio):
     armature = normalization.find_source_armature(source)
     camera = {
@@ -351,6 +395,7 @@ def main():
     assert_attachment_phase_regression(normalization)
 
     source = create_scene()
+    source_xml_path = synthetic_source_xml(source, args.output)
     camera_uv_bundle = synthetic_camera_bundle(
         source,
         normalization,
@@ -369,6 +414,7 @@ def main():
         replace_generated=True,
         configure_send2ue=False,
         camera_uv_bundle=camera_uv_bundle,
+        source_xml_path=source_xml_path,
     )
     if report["variant_count"] != 3:
         raise RuntimeError(f"Expected three variants: {report}")
@@ -499,6 +545,7 @@ def main():
         replace_generated=True,
         configure_send2ue=False,
         camera_uv_bundle=camera_uv_bundle,
+        source_xml_path=source_xml_path,
     )
     if second["variant_count"] != 3 or snapshot_source(source) != before:
         raise RuntimeError("Tagged rebuild failed or changed the source")
@@ -537,6 +584,7 @@ def main():
                 replace_generated=True,
                 configure_send2ue=False,
                 camera_uv_bundle=camera_uv_bundle,
+                source_xml_path=source_xml_path,
             )
         except RuntimeError as exc:
             if "intentional transactional smoke failure" not in str(exc):
@@ -563,6 +611,7 @@ def main():
         configure_send2ue=False,
         camera_uv_bundle=camera_uv_bundle,
         source_partition_mode="PER_CONNECTED_DEFORM_CLUSTER",
+        source_xml_path=source_xml_path,
     )
     if (
         connected["source_partition_mode"] != "PER_CONNECTED_DEFORM_CLUSTER"

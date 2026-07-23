@@ -20,6 +20,7 @@ from .atlas_handoff import (
     _same_path,
     _validate_reference_artifacts,
 )
+from .attachment_contract import _parse_speedtree_xml
 from .normalization import (
     ASSET_ROLE_KEY,
     CARD_PROTOTYPE_MAP_HASH_KEY,
@@ -32,6 +33,10 @@ from .normalization import (
     PROTOTYPE_ASSET_KEY,
     PROTOTYPE_INDEX_KEY,
     SOURCE_PARTITION_MODE_KEY,
+    SOURCE_3D_CONTRACT_HASH_KEY,
+    SOURCE_3D_CONTRACT_KEY,
+    XML_ATTACHMENT_KEY,
+    PLAN_ROOT_LOCK_KEY,
     UV_TRANSFER_ATTACHMENT_POLICY,
     UV_TRANSFER_CANDIDATE_SELECTION_POLICY,
     UV_TRANSFER_KEY,
@@ -61,6 +66,98 @@ def _json_property(owner, key, label):
     if not isinstance(result, dict):
         raise ValueError(f"Camera delivery {label} must be a JSON object.")
     return result
+
+
+def _validate_source_3d_contract(scene):
+    contract = _json_property(scene, SOURCE_3D_CONTRACT_KEY, "source 3D contract")
+    expected_hash = str(scene.get(SOURCE_3D_CONTRACT_HASH_KEY) or "")
+    if not expected_hash or _canonical_sha256(contract) != expected_hash:
+        raise ValueError("Source 3D contract hash is missing or stale.")
+    for path_key, hash_key, label in (
+        ("xml_path", "xml_sha256", "Source 3D XML"),
+        ("source_spm", "source_spm_sha256", "Source 3D SPM"),
+        ("source_fbx", "source_fbx_sha256", "Source 3D FBX"),
+    ):
+        path = Path(str(contract.get(path_key) or ""))
+        expected = str(contract.get(hash_key) or "")
+        if not path.is_file() or not expected or _sha256(path) != expected:
+            raise ValueError(f"{label} hash is missing or stale.")
+    scale = float(contract.get("scale", math.nan))
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Source 3D contract scale is invalid.")
+    root_ids = [int(value) for value in contract.get("root_ids") or []]
+    if not root_ids or len(root_ids) != len(set(root_ids)):
+        raise ValueError("Source 3D contract root IDs are missing or duplicated.")
+    xml_path = Path(contract["xml_path"]).resolve()
+    parsed_source_spm_text, parsed_bones = _parse_speedtree_xml(xml_path)
+    parsed_source_spm = Path(parsed_source_spm_text).expanduser()
+    if not parsed_source_spm.is_absolute():
+        parsed_source_spm = xml_path.parent / parsed_source_spm
+    if not _same_path(parsed_source_spm, contract["source_spm"]):
+        raise ValueError("Source 3D XML points to a different source SPM.")
+    parsed_roots = [bone for bone in parsed_bones if int(bone["parent_id"]) == -1]
+    if [int(root["id"]) for root in parsed_roots] != root_ids:
+        raise ValueError("Source 3D XML structural roots differ from its contract.")
+    authoritative_roots = [
+        {
+            "xml_bone_id": int(root["id"]),
+            "xml_parent_id": int(root["parent_id"]),
+            "xml_start_world": [float(value) for value in root["start_raw"] / scale],
+            "xml_end_world": [float(value) for value in root["end_raw"] / scale],
+            "xml_radius_world": float(root["radius_raw"] / scale),
+            "xml_generator": str(root.get("generator") or ""),
+        }
+        for root in parsed_roots
+    ]
+    xml_mtime_ns = int(contract.get("xml_mtime_ns", -1))
+    if xml_mtime_ns != xml_path.stat().st_mtime_ns:
+        raise ValueError("Source 3D XML timestamp differs from its contract.")
+    for source_key in ("source_spm", "source_fbx"):
+        if Path(str(contract[source_key])).stat().st_mtime_ns > xml_mtime_ns:
+            raise ValueError("Source 3D XML is older than its source export.")
+    return contract, expected_hash, root_ids, authoritative_roots
+
+
+def _validate_xml_attachment(value, label):
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object.")
+    start = _finite_vector(value.get("xml_start_world"), 3, f"{label} start")
+    end = _finite_vector(value.get("xml_end_world"), 3, f"{label} end")
+    if (Vector(end) - Vector(start)).length <= _TOLERANCE:
+        raise ValueError(f"{label} segment is degenerate.")
+    root_id = int(value.get("xml_bone_id", -1))
+    if root_id < 0 or int(value.get("xml_parent_id", 0)) >= 0:
+        raise ValueError(f"{label} is not an XML structural root.")
+    tolerance = float(value.get("match_tolerance", math.nan))
+    start_error = float(value.get("start_match_error", math.nan))
+    end_error = float(value.get("end_match_error", math.nan))
+    if (
+        not all(math.isfinite(item) for item in (tolerance, start_error, end_error))
+        or tolerance < 0.0
+        or start_error < 0.0
+        or end_error < 0.0
+        or start_error > tolerance + _TOLERANCE
+        or end_error > tolerance + _TOLERANCE
+    ):
+        raise ValueError(f"{label} match error exceeds its contract.")
+    return value
+
+
+def _attachment_matches_contract(attachment, root):
+    if (
+        int(attachment.get("xml_bone_id", -1)) != int(root.get("xml_bone_id", -2))
+        or int(attachment.get("xml_parent_id", 0)) != int(root.get("xml_parent_id", 1))
+        or str(attachment.get("xml_generator") or "")
+        != str(root.get("xml_generator") or "")
+    ):
+        return False
+    for key in ("xml_start_world", "xml_end_world"):
+        if (Vector(attachment[key]) - Vector(root[key])).length > _TOLERANCE:
+            return False
+    return abs(
+        float(attachment.get("xml_radius_world", math.nan))
+        - float(root.get("xml_radius_world", math.nan))
+    ) <= _TOLERANCE
 
 
 def _validate_composite_parts(value, label):
@@ -608,6 +705,12 @@ def validate_camera_uv_delivery(
         raise ValueError("Scene camera bundle references another contract.")
     if bundle.get("reference_collection") != CAMERA_REFERENCE_COLLECTION:
         raise ValueError("Scene camera bundle references another reference collection.")
+    (
+        source_3d_contract,
+        source_3d_contract_hash,
+        source_3d_root_ids,
+        authoritative_source_3d_roots,
+    ) = _validate_source_3d_contract(scene)
     validation = contract.get("validation") or {}
     if (
         validation.get("status") != "ready"
@@ -741,6 +844,12 @@ def validate_camera_uv_delivery(
     if int(prototype_map.get("prototype_count", -1)) != prototype_count:
         raise ValueError("Card/prototype mapping prototype count is stale.")
     if (
+        str(prototype_map.get("source_3d_contract_sha256") or "")
+        != source_3d_contract_hash
+        or prototype_count != len(source_3d_root_ids)
+    ):
+        raise ValueError("Card/prototype XML root contract is missing or stale.")
+    if (
         expected_prototype_count is not None
         and prototype_count != int(expected_prototype_count)
     ):
@@ -749,6 +858,7 @@ def validate_camera_uv_delivery(
         )
     references = []
     rows = []
+    seen_xml_root_ids = set()
     for plane in planes:
         plan = plan_objects[plane["name"]]
         mapping = mapping_by_plan[plane["name"]]
@@ -772,6 +882,39 @@ def validate_camera_uv_delivery(
             raise ValueError(f"Plan reference pointer mismatch: {plan.name}")
         if not _identity_object(plan):
             raise ValueError(f"Camera delivery plan is not an identity object: {plan.name}")
+
+        plan_source_3d_contract = _json_property(
+            plan, SOURCE_3D_CONTRACT_KEY, f"source 3D contract on {plan.name}"
+        )
+        plan_attachment = _validate_xml_attachment(
+            _json_property(plan, XML_ATTACHMENT_KEY, f"XML attachment on {plan.name}"),
+            f"XML attachment on {plan.name}",
+        )
+        plan_root_lock = _json_property(
+            plan, PLAN_ROOT_LOCK_KEY, f"root lock on {plan.name}"
+        )
+        contract_root = next(
+            (
+                root
+                for root in authoritative_source_3d_roots
+                if int(root["xml_bone_id"])
+                == int(plan_attachment["xml_bone_id"])
+            ),
+            None,
+        )
+        if (
+            plan_source_3d_contract != source_3d_contract
+            or contract_root is None
+            or not _attachment_matches_contract(plan_attachment, contract_root)
+            or int(mapping.get("xml_bone_id", -1))
+            != int(plan_attachment["xml_bone_id"])
+            or int(plan_attachment["xml_bone_id"]) not in source_3d_root_ids
+        ):
+            raise ValueError(f"Plan XML attachment lineage mismatch: {plan.name}")
+        xml_root_id = int(plan_attachment["xml_bone_id"])
+        if xml_root_id in seen_xml_root_ids:
+            raise ValueError(f"Duplicate XML structural root mapping: {xml_root_id}")
+        seen_xml_root_ids.add(xml_root_id)
 
         transfer = _json_property(plan, UV_TRANSFER_KEY, f"UV transfer on {plan.name}")
         projection_basis = _json_property(
@@ -819,6 +962,9 @@ def validate_camera_uv_delivery(
             != prototype_map.get("source_partition_mode")
             or plan.get(COUNTERPART_KEY) != mapping.get("prototype_asset")
             or int(mapping.get("source_mesh_id", -1)) != int(plane["source_mesh_id"])
+            or transfer.get("source_3d_contract") != source_3d_contract
+            or transfer.get("xml_attachment") != plan_attachment
+            or transfer.get("plan_root_lock") != plan_root_lock
         ):
             raise ValueError(f"Plan UV transfer lineage mismatch: {plan.name}")
         normalized_rms = float(transfer.get("normalized_rms", math.inf))
@@ -923,6 +1069,28 @@ def validate_camera_uv_delivery(
             part = bpy.data.objects.get(part_name)
             if part is None or part.type != "MESH":
                 raise ValueError(f"Plan counterpart mesh is missing: {plan.name}")
+            part_source_3d_contract = _json_property(
+                part, SOURCE_3D_CONTRACT_KEY, f"source 3D contract on {part.name}"
+            )
+            part_attachment = _validate_xml_attachment(
+                _json_property(part, XML_ATTACHMENT_KEY, f"XML attachment on {part.name}"),
+                f"XML attachment on {part.name}",
+            )
+            if (
+                part_source_3d_contract != source_3d_contract
+                or part_attachment != plan_attachment
+            ):
+                raise ValueError(f"Plan/3D XML attachment mismatch: {plan.name}")
+            try:
+                part_frame = Matrix(
+                    json.loads(part["speedtree_cluster_frame_world"])
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"3D part frame is invalid: {part.name}") from exc
+            if (
+                part_frame.translation - Vector(part_attachment["xml_start_world"])
+            ).length > _TOLERANCE:
+                raise ValueError(f"3D part frame does not start at XML root: {part.name}")
             coverage_points = [vertex.co.copy() for vertex in part.data.vertices]
         try:
             right = Vector(projection_basis["right"])
@@ -996,6 +1164,87 @@ def validate_camera_uv_delivery(
             > _TOLERANCE
         ):
             raise ValueError(f"Plan stored projection coverage is stale: {plan.name}")
+        if plan_composite_parts:
+            raise ValueError(
+                "XML physical-root delivery does not accept a composite card frame."
+            )
+        root_axis = Vector(
+            _finite_vector(plan_root_lock.get("root_axis_xy"), 2, "plan root axis")
+        )
+        source_camera_right = Vector(
+            _finite_vector(
+                projection_basis.get("source_camera_right"),
+                3,
+                "source camera right",
+            )
+        )
+        source_camera_up = Vector(
+            _finite_vector(
+                projection_basis.get("source_camera_up"),
+                3,
+                "source camera up",
+            )
+        )
+        xml_direction = Vector(plan_attachment["xml_end_world"]) - Vector(
+            plan_attachment["xml_start_world"]
+        )
+        expected_root_axis = Vector(
+            (xml_direction.dot(source_camera_right), xml_direction.dot(source_camera_up))
+        )
+        if expected_root_axis.length <= _TOLERANCE:
+            raise ValueError(f"XML root collapses in plan projection: {plan.name}")
+        expected_root_axis.normalize()
+        if (
+            abs(root_axis.length - 1.0) > _TOLERANCE
+            or (root_axis - expected_root_axis).length > _TOLERANCE
+        ):
+            raise ValueError(f"Plan root axis is not normalized: {plan.name}")
+        part_root_support = min(
+            Vector(point).dot(root_axis) for point in projected_coverage_points
+        )
+        plan_root_support = min(
+            Vector(point).dot(root_axis) for point in plan_boundary
+        )
+        stored_unexpanded_support = float(
+            plan_root_lock.get("unexpanded_root_support", math.nan)
+        )
+        stored_locked_support = float(
+            plan_root_lock.get("locked_root_support", math.nan)
+        )
+        root_tolerance = float(plan_root_lock.get("tolerance", math.nan))
+        spans = [
+            max(point[index] for point in projected_coverage_points)
+            - min(point[index] for point in projected_coverage_points)
+            for index in range(2)
+        ]
+        expected_root_tolerance = max(math.hypot(*spans) * 1.0e-7, 1.0e-9)
+        maximum_trim = float(
+            plan_root_lock.get("maximum_root_margin_trim", math.nan)
+        )
+        if (
+            plan_root_lock.get("policy")
+            != "xml_root_tangent_preserve_unexpanded_projection_support"
+            or plan_root_lock.get("attachment_inside_unexpanded_projection") is not True
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    part_root_support,
+                    plan_root_support,
+                    stored_unexpanded_support,
+                    stored_locked_support,
+                    root_tolerance,
+                    maximum_trim,
+                )
+            )
+            or root_tolerance <= 0.0
+            or abs(root_tolerance - expected_root_tolerance) > _TOLERANCE * 1.0e-3
+            or maximum_trim < 0.0
+            or plan_root_lock.get("attachment_xy") != [0.0, 0.0]
+            or abs(part_root_support - stored_unexpanded_support) > root_tolerance
+            or abs(plan_root_support - stored_locked_support) > root_tolerance
+            or abs(part_root_support - plan_root_support) > root_tolerance
+        ):
+            raise ValueError(f"Plan XML root support lock is stale: {plan.name}")
         rows.append(
             {
                 "plan": plan.name,
@@ -1007,9 +1256,13 @@ def validate_camera_uv_delivery(
                 "composite_subpart_count": len(plan_composite_parts),
                 "projection_coverage": actual_projection_coverage,
                 "external_uv_validation": external_uv_validation,
+                "xml_bone_id": int(plan_attachment["xml_bone_id"]),
+                "plan_root_lock": plan_root_lock,
             }
         )
 
+    if seen_xml_root_ids != set(source_3d_root_ids):
+        raise ValueError("Delivery plans do not map every XML structural root exactly once.")
     export_names = _validate_export(
         scene,
         list(plan_objects.values()),
@@ -1028,6 +1281,7 @@ def validate_camera_uv_delivery(
         "prototype_count": prototype_count,
         "source_partition_mode": prototype_map.get("source_partition_mode"),
         "card_prototype_map_sha256": prototype_map_hash,
+        "source_3d_contract_sha256": source_3d_contract_hash,
         "export_objects": export_names,
         "planes": rows,
     }

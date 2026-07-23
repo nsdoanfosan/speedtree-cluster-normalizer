@@ -1,0 +1,205 @@
+import json
+import os
+import tempfile
+from pathlib import Path
+
+import addon_utils
+import bpy
+from mathutils import Matrix, Vector
+
+
+addon_utils.enable("speedtree_cluster_normalizer", default_set=False)
+from speedtree_cluster_normalizer.attachment_contract import (
+    load_attachment_contract,
+    match_root_attachment,
+)
+from speedtree_cluster_normalizer.normalization import (
+    convex_hull_2d,
+    point_in_convex_polygon,
+    root_locked_expanded_hull,
+)
+
+
+def build_armature(name, orphan_end=False):
+    data = bpy.data.armatures.new(name + "Data")
+    armature = bpy.data.objects.new(name, data)
+    bpy.context.scene.collection.objects.link(armature)
+    bpy.context.view_layer.objects.active = armature
+    armature.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    if orphan_end:
+        end = data.edit_bones.new("Bone_1_End")
+        end.head = (1.0, 4.0, 3.0)
+        end.tail = (1.0, 4.1, 3.0)
+    else:
+        start = data.edit_bones.new("Bone_1_Start")
+        start.head = (1.0, 2.0, 3.0)
+        start.tail = (1.0, 4.0, 3.0)
+        end = data.edit_bones.new("Bone_1_End")
+        end.head = (1.0, 4.0, 3.0)
+        end.tail = (1.0, 4.1, 3.0)
+        end.parent = start
+    bpy.ops.object.mode_set(mode="OBJECT")
+    armature.select_set(False)
+    return armature
+
+
+def root_lock_case(points, axis):
+    base = convex_hull_2d(points)
+    direction = Vector(axis).normalized()
+    expected_support = min(Vector(point).dot(direction) for point in base)
+    hull, report = root_locked_expanded_hull(points, 0.2, axis)
+    actual_support = min(Vector(point).dot(direction) for point in hull)
+    if abs(expected_support - actual_support) > 1.0e-8:
+        raise RuntimeError((expected_support, actual_support, report))
+    if not all(point_in_convex_polygon(point, hull, tolerance=1.0e-8) for point in points):
+        raise RuntimeError("Root-locked margin lost a source projection point")
+    if report["maximum_root_margin_trim"] <= 0.0:
+        raise RuntimeError("Synthetic root lock did not trim root-side margin")
+    return report
+
+
+with tempfile.TemporaryDirectory(prefix="stcluster_xml_") as directory:
+    root = Path(directory)
+    spm = root / "SK_synthetic.spm"
+    fbx = root / "SK_synthetic.fbx"
+    xml = root / "SK_synthetic.xml"
+    spm.write_bytes(b"synthetic-spm")
+    fbx.write_bytes(b"synthetic-fbx")
+    xml.write_text(
+        f'<SpeedTreeRaw Source="{spm}"><Bones>'
+        '<Bone ID="0" ParentID="-1" StartX="100" StartY="200" StartZ="300" '
+        'EndX="100" EndY="400" EndZ="300" Radius="25" Generator="Synthetic"/>'
+        '</Bones></SpeedTreeRaw>',
+        encoding="utf-8",
+    )
+    source_mesh = bpy.data.meshes.new("SyntheticSourceMesh")
+    source = bpy.data.objects.new("SyntheticSource", source_mesh)
+    bpy.context.scene.collection.objects.link(source)
+    source["codex_source_fbx"] = str(fbx)
+
+    start_armature = build_armature("SyntheticStartArmature")
+    contract = load_attachment_contract(
+        bpy.context.scene,
+        source,
+        start_armature,
+        explicit_xml_path=str(xml),
+    )
+    if contract["scale"] != 100.0 or [row["id"] for row in contract["roots"]] != [0]:
+        raise RuntimeError("Synthetic XML scale/root contract failed")
+    start_bone = start_armature.data.bones["Bone_1_Start"]
+    endpoint_bone = start_armature.data.bones["Bone_1_End"]
+    start_match = match_root_attachment(
+        contract,
+        start_armature,
+        start_bone,
+        endpoint_bone,
+        10.0,
+        set(),
+    )
+    if Vector(start_match["xml_start_world"]) != Vector((1.0, 2.0, 3.0)):
+        raise RuntimeError("Start joint did not resolve the XML physical root")
+
+    orphan_armature = build_armature("SyntheticOrphanArmature", orphan_end=True)
+    orphan_match = match_root_attachment(
+        contract,
+        orphan_armature,
+        orphan_armature.data.bones["Bone_1_End"],
+        None,
+        10.0,
+        set(),
+    )
+    if (
+        orphan_match["match_policy"]
+        != "xml_root_end_identifies_missing_start_joint"
+        or Vector(orphan_match["xml_start_world"]) != Vector((1.0, 2.0, 3.0))
+    ):
+        raise RuntimeError("Orphan End did not recover the XML segment Start")
+
+    malformed_xml = root / "SK_synthetic_bad.xml"
+    malformed_xml.write_text(
+        f'<SpeedTreeRaw Source="{spm}"><Bones>'
+        '<Bone ID="0" ParentID="-1" StartX="100" StartY="200" StartZ="300" '
+        'EndX="100" EndY="400" Radius="25" Generator="Synthetic"/>'
+        '</Bones></SpeedTreeRaw>',
+        encoding="utf-8",
+    )
+    try:
+        load_attachment_contract(
+            bpy.context.scene,
+            source,
+            start_armature,
+            explicit_xml_path=str(malformed_xml),
+        )
+    except ValueError as exc:
+        if "invalid Bone entry" not in str(exc):
+            raise
+    else:
+        raise RuntimeError("Malformed XML Bone was silently skipped")
+
+    negative_parent_xml = root / "SK_synthetic_negative_parent.xml"
+    negative_parent_xml.write_text(
+        f'<SpeedTreeRaw Source="{spm}"><Bones>'
+        '<Bone ID="0" ParentID="-2" StartX="100" StartY="200" StartZ="300" '
+        'EndX="100" EndY="400" EndZ="300" Radius="25" Generator="Synthetic"/>'
+        '</Bones></SpeedTreeRaw>',
+        encoding="utf-8",
+    )
+    try:
+        load_attachment_contract(
+            bpy.context.scene,
+            source,
+            start_armature,
+            explicit_xml_path=str(negative_parent_xml),
+        )
+    except ValueError as exc:
+        if "invalid negative ParentID" not in str(exc):
+            raise
+    else:
+        raise RuntimeError("ParentID below -1 was accepted as a structural root")
+
+    stale_time = xml.stat().st_mtime_ns + 10_000_000
+    os.utime(spm, ns=(stale_time, stale_time))
+    try:
+        load_attachment_contract(
+            bpy.context.scene,
+            source,
+            start_armature,
+            explicit_xml_path=str(xml),
+        )
+    except ValueError as exc:
+        if "older" not in str(exc):
+            raise
+    else:
+        raise RuntimeError("Stale XML contract was not rejected")
+
+reports = {
+    "positive_y": root_lock_case(
+        [(-1.0, 0.0), (1.0, 0.0), (1.5, 4.0), (-1.2, 4.0)],
+        (0.0, 1.0),
+    ),
+    "negative_y": root_lock_case(
+        [(-1.0, 0.0), (1.0, 0.0), (1.5, -4.0), (-1.2, -4.0)],
+        (0.0, -1.0),
+    ),
+    "positive_x": root_lock_case(
+        [(0.0, -1.0), (0.0, 1.0), (4.0, 1.5), (4.0, -1.2)],
+        (1.0, 0.0),
+    ),
+}
+try:
+    root_locked_expanded_hull(
+        [(2.0, 2.0), (3.0, 2.0), (3.0, 3.0), (2.0, 3.0)],
+        0.1,
+        (0.0, 1.0),
+    )
+except ValueError as exc:
+    if "outside" not in str(exc):
+        raise
+else:
+    raise RuntimeError("An unrelated XML attachment was silently accepted")
+
+print(
+    "__XML_ATTACHMENT_ROOT_LOCK_SMOKE__"
+    + json.dumps({"status": "passed", "root_lock_cases": reports}, sort_keys=True)
+)
