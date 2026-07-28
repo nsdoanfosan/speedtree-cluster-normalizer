@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -86,6 +88,10 @@ def main():
         EXPECTED_TRANSFER_POLICY,
         validate_camera_uv_delivery,
     )
+    from speedtree_cluster_normalizer.attachment_contract import (
+        SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        spm_structural_semantic_fingerprint,
+    )
     from speedtree_cluster_normalizer.normalization import (
         ASSET_ROLE_KEY,
         CARD_PROTOTYPE_MAP_HASH_KEY,
@@ -118,7 +124,32 @@ def main():
     source_xml = asset_dir / "SK_branch_test.xml"
     camera_spm.write_text("<SpeedTree camera='synthetic'/>", encoding="utf-8")
     tree_spm.write_text("<SpeedTree tree='synthetic'/>", encoding="utf-8")
-    source_spm.write_bytes(b"synthetic-source-spm")
+    source_spm_text = """\
+<SpeedTree>
+  <Assets>
+    <Material_v8 ID="1" Name="Raw Material">
+      <CutoutMeshID>4</CutoutMeshID>
+      <Width>16</Width><Height>16</Height>
+      <Map Name="Color"><TexFilename>raw_source.tga</TexFilename></Map>
+    </Material_v8>
+  </Assets>
+  <Preview>old-preview</Preview>
+  <Generator Type="Branch">
+    <Name>Synthetic Generator</Name><GUID>branch-guid</GUID>
+    <Properties>
+      <Property><Name>Physics:Bones</Name><Value>1</Value></Property>
+      <Property><Name>Vertex Color:Red:Value</Name><Value>0</Value></Property>
+      <Property><Name>Materials:Branch:0:Material</Name><Value>12</Value></Property>
+    </Properties>
+  </Generator>
+  <Node Type="Branch">
+    <GeneratorGUID>branch-guid</GeneratorGUID>
+    <ParentGUID>tree-node</ParentGUID><GUID>branch-node</GUID>
+    <Properties><Seed>10</Seed></Properties>
+  </Node>
+</SpeedTree>
+"""
+    source_spm.write_bytes(gzip.compress(source_spm_text.encode("utf-8")))
     source_fbx.write_bytes(b"synthetic-source-fbx")
     source_xml.write_text(
         '<SpeedTreeRaw Source="{}"><Bones>{}</Bones></SpeedTreeRaw>'.format(
@@ -141,6 +172,10 @@ def main():
         "xml_mtime_ns": int(source_xml.stat().st_mtime_ns),
         "source_spm": str(source_spm),
         "source_spm_sha256": sha256(source_spm),
+        "source_spm_semantic_projection_version":
+            SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        "source_spm_semantic_fingerprint":
+            spm_structural_semantic_fingerprint(source_spm),
         "source_fbx": str(source_fbx),
         "source_fbx_sha256": sha256(source_fbx),
         "scale": 100.0,
@@ -538,6 +573,102 @@ def main():
     ):
         raise RuntimeError("Non-zero camera attachment contract was not independently validated")
     failures = {}
+
+    original_source_spm_sha256 = source_3d_contract["source_spm_sha256"]
+    cosmetic_source_spm_text = (
+        source_spm_text.replace("Raw Material", "Canonical Material")
+        .replace("raw_source.tga", r"D:\canonical\T_branch_color.tga")
+        .replace("old-preview", "new-preview")
+        .replace(
+            "<Name>Vertex Color:Red:Value</Name><Value>0</Value>",
+            "<Name>Vertex Color:Red:Value</Name><Value>1</Value>",
+        )
+        .replace(
+            "<Name>Materials:Branch:0:Material</Name><Value>12</Value>",
+            "<Name>Materials:Branch:0:Material</Name><Value>47</Value>",
+        )
+    )
+    source_spm.write_bytes(gzip.compress(cosmetic_source_spm_text.encode("utf-8")))
+    if (
+        sha256(source_spm) == original_source_spm_sha256
+        or spm_structural_semantic_fingerprint(source_spm)
+        != source_3d_contract["source_spm_semantic_fingerprint"]
+        or source_3d_contract["source_spm_sha256"] != original_source_spm_sha256
+    ):
+        raise RuntimeError(
+            "Synthetic texture-only SPM rewrite did not isolate raw and semantic hashes"
+        )
+    validate()
+
+    source_spm.write_bytes(
+        gzip.compress(
+            cosmetic_source_spm_text.replace(
+                "<Name>Physics:Bones</Name><Value>1</Value>",
+                "<Name>Physics:Bones</Name><Value>2</Value>",
+            ).encode("utf-8")
+        )
+    )
+    failures["source_spm_bone_change_rejected"] = expect_failure(
+        "source SPM bone semantics changed",
+        validate,
+        "structural semantic fingerprint",
+    )
+    source_spm.write_bytes(gzip.compress(cosmetic_source_spm_text.encode("utf-8")))
+
+    source_spm.write_bytes(
+        gzip.compress(
+            cosmetic_source_spm_text.replace(
+                "<CutoutMeshID>4</CutoutMeshID>",
+                "<CutoutMeshID>5</CutoutMeshID>",
+            ).encode("utf-8")
+        )
+    )
+    failures["source_spm_cutout_change_rejected"] = expect_failure(
+        "source SPM cutout geometry changed",
+        validate,
+        "structural semantic fingerprint",
+    )
+    source_spm.write_bytes(gzip.compress(cosmetic_source_spm_text.encode("utf-8")))
+
+    original_source_fbx_bytes = source_fbx.read_bytes()
+    original_source_fbx_stat = source_fbx.stat()
+    source_fbx.write_bytes(original_source_fbx_bytes + b"-changed")
+    failures["source_fbx_change_rejected"] = expect_failure(
+        "source FBX changed",
+        validate,
+        "Source 3D FBX hash",
+    )
+    source_fbx.write_bytes(original_source_fbx_bytes)
+    os.utime(
+        source_fbx,
+        ns=(
+            original_source_fbx_stat.st_atime_ns,
+            original_source_fbx_stat.st_mtime_ns,
+        ),
+    )
+
+    original_source_xml_text = source_xml.read_text(encoding="utf-8")
+    original_source_xml_stat = source_xml.stat()
+    source_xml.write_text(
+        original_source_xml_text.replace(
+            'Generator="Synthetic"',
+            'Generator="Changed"',
+        ),
+        encoding="utf-8",
+    )
+    failures["source_xml_change_rejected"] = expect_failure(
+        "source XML changed",
+        validate,
+        "Source 3D XML hash",
+    )
+    source_xml.write_text(original_source_xml_text, encoding="utf-8")
+    os.utime(
+        source_xml,
+        ns=(
+            original_source_xml_stat.st_atime_ns,
+            original_source_xml_stat.st_mtime_ns,
+        ),
+    )
 
     plan = plans[0]
     part = bpy.data.objects["SK_branch_test_01_Mesh"]

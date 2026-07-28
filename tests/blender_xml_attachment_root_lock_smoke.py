@@ -15,6 +15,8 @@ from speedtree_cluster_normalizer.attachment_contract import (
     fit_attachment_to_geometry,
     load_attachment_contract,
     match_root_attachment,
+    serialized_contract_source,
+    spm_structural_semantic_fingerprint,
 )
 from speedtree_cluster_normalizer.normalization import (
     _preferred_endpoint_bone,
@@ -133,7 +135,12 @@ with tempfile.TemporaryDirectory(prefix="stcluster_xml_") as directory:
     spm = root / "SK_synthetic.spm"
     fbx = root / "SK_synthetic.fbx"
     xml = root / "SK_synthetic.xml"
-    spm.write_bytes(b"synthetic-spm")
+    spm.write_text(
+        "<SpeedTree><Generator Type=\"Branch\"><Properties>"
+        "<Property><Name>Physics:Bones</Name><Value>1</Value></Property>"
+        "</Properties></Generator></SpeedTree>",
+        encoding="utf-8",
+    )
     fbx.write_bytes(b"synthetic-fbx")
     xml.write_text(
         f'<SpeedTreeRaw Source="{spm}"><Bones>'
@@ -156,6 +163,17 @@ with tempfile.TemporaryDirectory(prefix="stcluster_xml_") as directory:
     )
     if contract["scale"] != 100.0 or [row["id"] for row in contract["roots"]] != [0]:
         raise RuntimeError("Synthetic XML scale/root contract failed")
+    serialized_contract = serialized_contract_source(contract)
+    if (
+        serialized_contract.get("source_spm_semantic_fingerprint")
+        != spm_structural_semantic_fingerprint(spm)
+        or serialized_contract.get("source_spm_semantic_projection_version") != 1
+        or serialized_contract.get("source_spm_sha256")
+        != contract["source_spm_sha256"]
+    ):
+        raise RuntimeError(
+            "Source 3D contract did not preserve raw and semantic SPM fingerprints"
+        )
     start_bone = start_armature.data.bones["Bone_1_Start"]
     endpoint_bone = start_armature.data.bones["Bone_1_End"]
     start_match = match_root_attachment(

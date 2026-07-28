@@ -1,7 +1,11 @@
+import copy
+import gzip
 import hashlib
+import json
 import math
 import os
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import bpy
@@ -12,6 +16,20 @@ XML_ATTR_RE = re.compile(r'([A-Za-z][A-Za-z0-9]*)="([^"]*)"')
 XML_SOURCE_RE = re.compile(r'<SpeedTreeRaw\b[^>]*\bSource="([^"]+)"')
 XML_SCALE_CANDIDATES = (100.0, 1.0, 3.28084, 30.48, 0.01)
 GEOMETRY_SUPPORTED_ATTACHMENT_POLICY = "geometry_supported_xml_root_segment"
+SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION = 1
+
+_IGNORED_SPM_SUBTREE_TAGS = frozenset({"Thumbnail", "Preview"})
+_SPM_MATERIAL_GEOMETRY_TAGS = frozenset(
+    {
+        "CutoutMeshID",
+        "SupplementalCutoutMeshIDs",
+        "UVAreas",
+        "Width",
+        "Height",
+        "UnwrapScale",
+        "AtlasMaker",
+    }
+)
 
 
 def _parse_speedtree_xml_number(value, label):
@@ -37,6 +55,117 @@ def _sha256(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _local_xml_tag(tag):
+    return str(tag).rsplit("}", 1)[-1]
+
+
+def _is_spm_material_slot_property(name):
+    folded = str(name or "").strip().casefold()
+    return (
+        folded.endswith(":material")
+        or folded.startswith("materials:")
+        or folded
+        in {
+            "material:frond",
+            "mesh:material",
+            "mesh:render material",
+        }
+    )
+
+
+def _spm_material_slot_assignment_state(raw_value):
+    value = str(raw_value or "").strip()
+    if not value or value.casefold() in {"none", "null", "unassigned"}:
+        return "UNASSIGNED"
+    try:
+        if float(value) < 0:
+            return "UNASSIGNED"
+    except ValueError:
+        pass
+    return "ASSIGNED"
+
+
+def _remove_non_structural_spm_content(parent):
+    """Project an SPM onto structure that can affect normalized delivery."""
+    for child in list(parent):
+        tag = _local_xml_tag(child.tag)
+        remove = tag in _IGNORED_SPM_SUBTREE_TAGS
+        if tag == "Material_v8":
+            cutout = child.findtext("CutoutMeshID")
+            supplemental = child.find("SupplementalCutoutMeshIDs")
+            uv_areas = child.find("UVAreas")
+            has_geometry = (
+                str(cutout or "").strip() not in {"", "-1"}
+                or (
+                    supplemental is not None
+                    and str(supplemental.get("Count") or "0") != "0"
+                )
+                or (
+                    uv_areas is not None
+                    and str(uv_areas.get("Count") or "0") != "0"
+                )
+            )
+            if not has_geometry:
+                parent.remove(child)
+                continue
+            child.attrib.pop("Name", None)
+            for material_child in list(child):
+                if (
+                    _local_xml_tag(material_child.tag)
+                    not in _SPM_MATERIAL_GEOMETRY_TAGS
+                ):
+                    child.remove(material_child)
+            continue
+        if tag == "Property":
+            name = str(child.findtext("Name") or "").strip().casefold()
+            remove = name.startswith("vertex color:")
+            if not remove and _is_spm_material_slot_property(name):
+                value = child.find("Value")
+                if value is not None:
+                    value.text = _spm_material_slot_assignment_state(value.text)
+        if remove:
+            parent.remove(child)
+            continue
+        _remove_non_structural_spm_content(child)
+        if (
+            _local_xml_tag(child.tag) == "Assets"
+            and not list(child)
+            and not str(child.text or "").strip()
+        ):
+            parent.remove(child)
+
+
+def _decode_spm_xml(path):
+    payload = Path(path).read_bytes()
+    if payload.startswith(b"\x1f\x8b"):
+        payload = gzip.decompress(payload)
+    return payload.decode("utf-8")
+
+
+def spm_structural_semantic_fingerprint(path):
+    """Hash SPM bone/geometry/cutout/generator semantics, not texture authoring."""
+    root = ET.fromstring(_decode_spm_xml(path))
+    projected = copy.deepcopy(root)
+    _remove_non_structural_spm_content(projected)
+    source = ET.tostring(
+        projected,
+        encoding="unicode",
+        short_empty_elements=True,
+    )
+    source = re.sub(r">\s+<", "><", source).strip()
+    payload = json.dumps(
+        {
+            "projection_version": SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+            "source": source,
+            "context": {},
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
 
 def _resolved_existing_path(value, label, *, relative_to=None):
@@ -264,6 +393,10 @@ def load_attachment_contract(scene, source, armature, explicit_xml_path=""):
         "xml_mtime_ns": int(xml_mtime),
         "source_spm": str(source_spm),
         "source_spm_sha256": _sha256(source_spm),
+        "source_spm_semantic_projection_version":
+            SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
+        "source_spm_semantic_fingerprint":
+            spm_structural_semantic_fingerprint(source_spm),
         "source_fbx": str(source_fbx),
         "source_fbx_sha256": _sha256(source_fbx),
         "scale": float(scale),
@@ -426,6 +559,12 @@ def serialized_contract_source(contract):
         "xml_mtime_ns": contract["xml_mtime_ns"],
         "source_spm": contract["source_spm"],
         "source_spm_sha256": contract["source_spm_sha256"],
+        "source_spm_semantic_projection_version": contract[
+            "source_spm_semantic_projection_version"
+        ],
+        "source_spm_semantic_fingerprint": contract[
+            "source_spm_semantic_fingerprint"
+        ],
         "source_fbx": contract["source_fbx"],
         "source_fbx_sha256": contract["source_fbx_sha256"],
         "scale": contract["scale"],

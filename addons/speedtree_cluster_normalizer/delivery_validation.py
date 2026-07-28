@@ -22,9 +22,11 @@ from .atlas_handoff import (
 )
 from .attachment_contract import (
     GEOMETRY_SUPPORTED_ATTACHMENT_POLICY,
+    SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
     _parse_speedtree_xml,
     attachment_endpoint_world,
     attachment_origin_world,
+    spm_structural_semantic_fingerprint,
 )
 from .normalization import (
     ASSET_ROLE_KEY,
@@ -129,13 +131,53 @@ def _validate_source_3d_contract(scene):
         raise ValueError("Source 3D contract hash is missing or stale.")
     for path_key, hash_key, label in (
         ("xml_path", "xml_sha256", "Source 3D XML"),
-        ("source_spm", "source_spm_sha256", "Source 3D SPM"),
         ("source_fbx", "source_fbx_sha256", "Source 3D FBX"),
     ):
         path = Path(str(contract.get(path_key) or ""))
         expected = str(contract.get(hash_key) or "")
         if not path.is_file() or not expected or _sha256(path) != expected:
             raise ValueError(f"{label} hash is missing or stale.")
+    source_spm = Path(str(contract.get("source_spm") or ""))
+    if not source_spm.is_file():
+        raise ValueError("Source 3D SPM is missing.")
+    semantic_fingerprint = str(
+        contract.get("source_spm_semantic_fingerprint") or ""
+    )
+    if semantic_fingerprint:
+        try:
+            projection_version = int(
+                contract.get(
+                    "source_spm_semantic_projection_version",
+                    -1,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Source 3D SPM structural semantic projection is unsupported."
+            ) from exc
+        if projection_version != SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION:
+            raise ValueError(
+                "Source 3D SPM structural semantic projection is unsupported."
+            )
+        try:
+            observed_semantic_fingerprint = (
+                spm_structural_semantic_fingerprint(source_spm)
+            )
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(
+                "Source 3D SPM structural semantic fingerprint cannot be read."
+            ) from exc
+        if observed_semantic_fingerprint != semantic_fingerprint:
+            raise ValueError(
+                "Source 3D SPM structural semantic fingerprint is missing or stale."
+            )
+    else:
+        expected_spm_sha256 = str(contract.get("source_spm_sha256") or "")
+        if (
+            not expected_spm_sha256
+            or _sha256(source_spm) != expected_spm_sha256
+        ):
+            raise ValueError("Source 3D SPM hash is missing or stale.")
     scale = float(contract.get("scale", math.nan))
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError("Source 3D contract scale is invalid.")
@@ -166,7 +208,12 @@ def _validate_source_3d_contract(scene):
     xml_mtime_ns = int(contract.get("xml_mtime_ns", -1))
     if xml_mtime_ns != xml_path.stat().st_mtime_ns:
         raise ValueError("Source 3D XML timestamp differs from its contract.")
-    for source_key in ("source_spm", "source_fbx"):
+    freshness_keys = (
+        ("source_fbx",)
+        if semantic_fingerprint
+        else ("source_spm", "source_fbx")
+    )
+    for source_key in freshness_keys:
         if Path(str(contract[source_key])).stat().st_mtime_ns > xml_mtime_ns:
             raise ValueError("Source 3D XML is older than its source export.")
     return contract, expected_hash, root_ids, authoritative_roots

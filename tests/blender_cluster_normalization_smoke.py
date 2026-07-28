@@ -140,7 +140,12 @@ def synthetic_source_xml(source, output_path, asset_stem="SK_branch_test"):
     spm = root / f"{asset_stem}.spm"
     fbx = root / f"{asset_stem}.fbx"
     xml = root / f"{asset_stem}.xml"
-    spm.write_bytes(b"synthetic-source-spm")
+    spm.write_text(
+        "<SpeedTree><Generator Type=\"Branch\"><Properties>"
+        "<Property><Name>Physics:Bones</Name><Value>1</Value></Property>"
+        "</Properties></Generator></SpeedTree>",
+        encoding="utf-8",
+    )
     fbx.write_bytes(b"synthetic-source-fbx")
     armature = source.find_armature()
     rows = []
