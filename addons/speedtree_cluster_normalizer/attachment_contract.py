@@ -11,6 +11,24 @@ from mathutils import Vector
 XML_ATTR_RE = re.compile(r'([A-Za-z][A-Za-z0-9]*)="([^"]*)"')
 XML_SOURCE_RE = re.compile(r'<SpeedTreeRaw\b[^>]*\bSource="([^"]+)"')
 XML_SCALE_CANDIDATES = (100.0, 1.0, 3.28084, 30.48, 0.01)
+GEOMETRY_SUPPORTED_ATTACHMENT_POLICY = "geometry_supported_xml_root_segment"
+
+
+def _parse_speedtree_xml_number(value, label):
+    """Parse SpeedTree Raw XML numbers written with dot or comma decimals."""
+    text = str("" if value is None else value).strip()
+    if not text:
+        raise ValueError(f"{label} is empty")
+    if "," in text:
+        if "." in text or text.count(",") != 1:
+            raise ValueError(
+                f"{label} has ambiguous decimal separators: {text!r}"
+            )
+        text = text.replace(",", ".")
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError(f"{label} is not finite: {value!r}")
+    return number
 
 
 def _sha256(path):
@@ -90,19 +108,34 @@ def _parse_speedtree_xml(path):
                             "parent_id": int(attrs["ParentID"]),
                             "start_raw": Vector(
                                 (
-                                    float(attrs["StartX"]),
-                                    float(attrs["StartY"]),
-                                    float(attrs["StartZ"]),
+                                    _parse_speedtree_xml_number(
+                                        attrs["StartX"], "StartX"
+                                    ),
+                                    _parse_speedtree_xml_number(
+                                        attrs["StartY"], "StartY"
+                                    ),
+                                    _parse_speedtree_xml_number(
+                                        attrs["StartZ"], "StartZ"
+                                    ),
                                 )
                             ),
                             "end_raw": Vector(
                                 (
-                                    float(attrs["EndX"]),
-                                    float(attrs["EndY"]),
-                                    float(attrs["EndZ"]),
+                                    _parse_speedtree_xml_number(
+                                        attrs["EndX"], "EndX"
+                                    ),
+                                    _parse_speedtree_xml_number(
+                                        attrs["EndY"], "EndY"
+                                    ),
+                                    _parse_speedtree_xml_number(
+                                        attrs["EndZ"], "EndZ"
+                                    ),
                                 )
                             ),
-                            "radius_raw": float(attrs.get("Radius", "0") or 0.0),
+                            "radius_raw": _parse_speedtree_xml_number(
+                                attrs.get("Radius", "0") or 0.0,
+                                "Radius",
+                            ),
                             "generator": attrs.get("Generator", ""),
                         }
                     )
@@ -313,6 +346,79 @@ def match_root_attachment(
     }
 
 
+def fit_attachment_to_geometry(attachment, world_points, geometry_scale):
+    """Resolve the usable root span from the structural XML segment and geometry."""
+    points = [Vector(point) for point in world_points]
+    scale = float(geometry_scale)
+    if len(points) < 3 or not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Geometry-supported attachment requires measurable geometry.")
+
+    start = Vector(attachment["xml_start_world"])
+    end = Vector(attachment["xml_end_world"])
+    segment = end - start
+    segment_length = float(segment.length)
+    tolerance = max(scale * 1.0e-4, 1.0e-6)
+    if segment_length <= tolerance:
+        raise ValueError("Geometry-supported XML root segment is degenerate.")
+    axis = segment / segment_length
+    projections = [float((point - start).dot(axis)) for point in points]
+    minimum_projection = min(projections)
+    maximum_projection = max(projections)
+    if (
+        maximum_projection < -tolerance
+        or minimum_projection > segment_length + tolerance
+    ):
+        raise ValueError(
+            "Prototype geometry does not overlap its XML structural root segment."
+        )
+
+    support_distance = min(
+        max(minimum_projection, 0.0),
+        segment_length,
+    )
+    if support_distance <= tolerance:
+        support_distance = 0.0
+    remaining_length = segment_length - support_distance
+    direction_length = min(remaining_length, scale)
+    if direction_length <= tolerance:
+        raise ValueError(
+            "Prototype geometry leaves no usable attachment direction on its "
+            "XML structural root segment."
+        )
+
+    effective_start = start + axis * support_distance
+    effective_end = effective_start + axis * direction_length
+    result = dict(attachment)
+    result.update(
+        {
+            "effective_attachment_world": effective_start,
+            "effective_endpoint_world": effective_end,
+            "effective_support_distance_world": float(support_distance),
+            "effective_direction_length_world": float(direction_length),
+            "effective_geometry_scale_world": scale,
+            "effective_support_min_projection_world": float(minimum_projection),
+            "effective_support_max_projection_world": float(maximum_projection),
+            "effective_support_tolerance_world": float(tolerance),
+            "effective_attachment_policy": GEOMETRY_SUPPORTED_ATTACHMENT_POLICY,
+        }
+    )
+    return result
+
+
+def attachment_origin_world(attachment):
+    return Vector(
+        attachment.get("effective_attachment_world")
+        or attachment["xml_start_world"]
+    )
+
+
+def attachment_endpoint_world(attachment):
+    return Vector(
+        attachment.get("effective_endpoint_world")
+        or attachment["xml_end_world"]
+    )
+
+
 def serialized_contract_source(contract):
     return {
         "xml_path": contract["xml_path"],
@@ -329,10 +435,16 @@ def serialized_contract_source(contract):
 
 
 def serialized_attachment(attachment):
+    vector_keys = {
+        "xml_start_world",
+        "xml_end_world",
+        "effective_attachment_world",
+        "effective_endpoint_world",
+    }
     return {
         key: (
             [float(value) for value in attachment[key]]
-            if key in {"xml_start_world", "xml_end_world"}
+            if key in vector_keys
             else attachment[key]
         )
         for key in (
@@ -348,5 +460,15 @@ def serialized_attachment(attachment):
             "start_match_error",
             "end_match_error",
             "match_tolerance",
+            "effective_attachment_world",
+            "effective_endpoint_world",
+            "effective_support_distance_world",
+            "effective_direction_length_world",
+            "effective_geometry_scale_world",
+            "effective_support_min_projection_world",
+            "effective_support_max_projection_world",
+            "effective_support_tolerance_world",
+            "effective_attachment_policy",
         )
+        if key in attachment
     }

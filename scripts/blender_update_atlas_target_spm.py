@@ -28,7 +28,14 @@ def parse_args():
     parser.add_argument("--source-material-id", required=True, type=int)
     parser.add_argument("--card-count", type=int)
     parser.add_argument("--prototype-count", type=int)
-    parser.add_argument("--mesh-scale", type=float, default=0.01)
+    parser.add_argument("--mesh-geometry-scale", type=float, default=0.01)
+    parser.add_argument(
+        "--mesh-asset-scale",
+        "--mesh-scale",
+        dest="mesh_asset_scale",
+        type=float,
+        default=1.0,
+    )
     parser.add_argument("--apply", action="store_true")
     return parser.parse_args(values)
 
@@ -60,7 +67,11 @@ def main():
     addon_utils.enable("speedtree_cluster_normalizer", default_set=False)
     addon_utils.enable("atlas_leaf_mesh_builder", default_set=False)
     from speedtree_cluster_normalizer.delivery_validation import (
-        validate_camera_uv_delivery,
+        validate_cluster_delivery,
+    )
+    from speedtree_cluster_normalizer.atlas_handoff import (
+        GENERATOR_VARIANT_POLICY,
+        _generator_mesh_coverage,
     )
     from atlas_leaf_mesh_builder.integration_api import configure_external_plan_target
     from atlas_leaf_mesh_builder.speedtree import (
@@ -75,7 +86,7 @@ def main():
     plan_objects = [obj for obj in plans.objects if obj.type == "MESH"]
     if not plan_objects:
         raise RuntimeError("Plan collection contains no mesh objects")
-    camera_delivery = validate_camera_uv_delivery(
+    camera_delivery = validate_cluster_delivery(
         bpy.context.scene,
         args.plan_collection,
         args.generated_material,
@@ -141,7 +152,9 @@ def main():
         source_material_id=args.source_material_id,
         adopt_source_material=True,
         only_target=True,
-        mesh_geometry_scale=args.mesh_scale,
+        mesh_geometry_scale=args.mesh_geometry_scale,
+        mesh_asset_scale=args.mesh_asset_scale,
+        generator_variant_policy=GENERATOR_VARIANT_POLICY,
     )
     cluster = bpy.context.scene.speedtree_cluster_normalizer
     cluster.atlas_camera_spm = str(camera_spm)
@@ -194,6 +207,20 @@ def main():
         raise RuntimeError(
             f"Generated plan mesh count mismatch: {generated_mesh_ids} vs {len(plan_objects)}"
         )
+    generator_slots = _generator_mesh_coverage(root, args.source_material_id)
+    covered_mesh_ids = {
+        int(row["mesh_id"])
+        for row in generator_slots
+        if int(row["mesh_id"]) in set(generated_mesh_ids)
+    }
+    missing_generator_mesh_ids = sorted(
+        set(generated_mesh_ids).difference(covered_mesh_ids)
+    )
+    if missing_generator_mesh_ids:
+        raise RuntimeError(
+            "Atlas build left normalized variations unreferenced by generators: "
+            + repr(missing_generator_mesh_ids)
+        )
 
     backups_after = set(backup_dir.glob("*.spm")) if backup_dir.is_dir() else set()
     created_backups = sorted(str(path) for path in backups_after - backups_before)
@@ -228,6 +255,9 @@ def main():
         "plan_objects": sorted(obj.name for obj in plan_objects),
         "manifest": str(manifest_path),
         "generator_connection": manifest.get("generator_connection"),
+        "generator_variant_policy": GENERATOR_VARIANT_POLICY,
+        "generator_slots": generator_slots,
+        "generator_covered_mesh_ids": sorted(covered_mesh_ids),
         "atlas_backups_created": created_backups,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)

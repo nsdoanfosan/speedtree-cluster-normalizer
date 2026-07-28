@@ -70,6 +70,7 @@ def main():
     source_names_before = sorted(obj.name for obj in bpy.data.objects)
 
     props = bpy.context.scene.speedtree_cluster_normalizer
+    props.workflow_mode = "LEGACY_CAMERA_UV"
     props.source_object = source
     props.plan_base_name = "branch_elm_01"
     props.skeletal_base_name = "SK_branch_elm_01"
@@ -88,7 +89,8 @@ def main():
     props.atlas_camera_name = "Dropped XY plane camera 2"
     props.atlas_target_spm = str(Path(args.target_spm).resolve())
     props.atlas_only_target = True
-    props.atlas_mesh_scale = 1.0
+    props.atlas_mesh_scale = 0.01
+    props.atlas_mesh_asset_scale = 1.0
     bpy.context.view_layer.objects.active = source
     source.select_set(True)
     result = bpy.ops.speedtree_cluster.build_normalized_assets()
@@ -110,8 +112,10 @@ def main():
         raise RuntimeError(f"Atlas generated material contract mismatch: {report['atlas_handoff']}")
     if report["atlas_handoff"].get("adopt_source_material") is not True:
         raise RuntimeError(f"Atlas source material was not configured for adoption: {report['atlas_handoff']}")
-    if report["atlas_handoff"].get("mesh_geometry_scale") != 1.0:
+    if report["atlas_handoff"].get("mesh_geometry_scale") != 0.01:
         raise RuntimeError(f"Atlas plan scale contract mismatch: {report['atlas_handoff']}")
+    if report["atlas_handoff"].get("mesh_asset_scale") != 1.0:
+        raise RuntimeError(f"SpeedTree Mesh Scale contract mismatch: {report['atlas_handoff']}")
     if sum(item["face_count"] for item in report["variants"]) != before["polygons"]:
         raise RuntimeError("Real split did not preserve the source polygon total")
     if report["mixed_face_count"] or report["unweighted_vertex_count"]:

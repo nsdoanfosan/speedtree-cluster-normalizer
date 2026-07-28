@@ -71,7 +71,7 @@ def main():
     addon_utils.enable("speedtree_cluster_normalizer", default_set=False)
     addon_utils.enable("atlas_leaf_mesh_builder", default_set=False)
     from speedtree_cluster_normalizer.delivery_validation import (
-        validate_camera_uv_delivery,
+        validate_cluster_delivery,
     )
     export_collection = bpy.data.collections.get("Export")
     if export_collection is None:
@@ -94,7 +94,7 @@ def main():
     ]
     if any(plan is None or plan.type != "MESH" for plan in plans):
         raise RuntimeError("Delivery blend is missing one or more normalized plans")
-    camera_delivery = validate_camera_uv_delivery(
+    camera_delivery = validate_cluster_delivery(
         bpy.context.scene,
         args.plan_collection,
         args.generated_material,
@@ -116,6 +116,7 @@ def main():
     from atlas_leaf_mesh_builder.target_registry import registry_path_for_blend
 
     cluster = bpy.context.scene.speedtree_cluster_normalizer
+    cluster.workflow_mode = "LEGACY_CAMERA_UV"
     source_object = bpy.data.objects.get(args.source_object)
     if source_object is None or source_object.type != "MESH":
         raise RuntimeError(f"Delivery source mesh is missing: {args.source_object}")
@@ -134,7 +135,8 @@ def main():
     cluster.atlas_camera_name = args.camera_name
     cluster.atlas_target_spm = str(target_spm)
     cluster.atlas_only_target = True
-    cluster.atlas_mesh_scale = 1.0
+    cluster.atlas_mesh_scale = 0.01
+    cluster.atlas_mesh_asset_scale = 1.0
 
     configured = configure_external_plan_target(
         bpy.context.scene.atlas_leaf_builder,
@@ -146,7 +148,9 @@ def main():
         source_material_id=args.source_material_id,
         adopt_source_material=True,
         only_target=True,
-        mesh_geometry_scale=1.0,
+        mesh_geometry_scale=0.01,
+        mesh_asset_scale=1.0,
+        generator_variant_policy="ensure_all_material_cutouts",
     )
     bpy.ops.wm.save_as_mainfile(filepath=str(save_to), check_existing=False)
     registry_path = registry_path_for_blend(save_to)

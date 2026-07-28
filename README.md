@@ -15,11 +15,32 @@ This add-on owns only:
 
 It does not export directly to Unreal and does not duplicate the Atlas add-on's SPM transaction code. Unreal delivery must use Send to Unreal. SPM modification must use Atlas Leaf Mesh Builder's existing `Target SPMs` and `Build/Update Target SPMs` operation.
 
+It can additionally bake a self-contained eight-map capture from the source 3D meshes. This is a Blender-side texture capture only: it does not overwrite an SPM, alter Atlas cutout geometry, or bypass Send to Unreal.
+
 ## Blender UI
 
 ```text
 3D Viewport > Sidebar > Cluster Normalize > SpeedTree Cluster Normalizer
 ```
+
+### Blender Auto Capture (8 Maps)
+
+`Blender Auto Capture (8 Maps)` renders the selected original source collection to the same output prefix with these files:
+
+```text
+<prefix>.tga
+<prefix>_Opacity.tga
+<prefix>_Normal.tga
+<prefix>_Gloss.tga
+<prefix>_Subsurface.tga
+<prefix>_SubsurfaceAmount.tga
+<prefix>_AO.tga
+<prefix>_Height.tga
+```
+
+Choose the source collection, output folder, prefix, square resolution, padding, and a capture plane in the panel. Only explicit world-axis `XY`, `XZ`, and `YZ` planes are available. `AUTO` is deliberately rejected because a bound-based choice can be ambiguous. Use `YZ (Side, 90°)` for a side cluster; it is an explicit 90° world-axis basis with no roll, not a best-fit camera rotation. The emitted manifest records that frame and the exact map fingerprints.
+
+The saved auto-capture delivery is a first-class validation mode, not a legacy-camera bypass. Before Atlas or Send to Unreal can run, the validator rechecks the manifest and all eight map hashes, the visible orthographic Camera/Area rig, the exact world-axis basis, every plan UV against its normalized frame, the XML-root pivot at local `0,0,0`, the plan-to-3D counterpart lineage, and the isolated `Export` hierarchy. `XY` must remain `+X/+Y`, view `-Z`, rotation `0°`; `YZ` side must remain `+Y/+Z`, view `-X`, rotation exactly `90°`. Any tilt, roll, stale UV, missing Color/Opacity node, or mixed legacy camera contract fails closed before delivery.
 
 For each populated deform group, the operator prefers a same-prefix `*_End` child of `*_Start`. The validated Start/pivot attachment remains the origin, while every 3D prototype and its plan share one rigid camera-aligned canonical frame (`camera right`, `camera up`, `camera normal`). The original bone frame is retained as metadata. No rule depends on one example's dimensions.
 
@@ -42,13 +63,15 @@ Generated plans such as `branch_elm_01_01` are identity-transform convex project
 
 UVs do not use the plan bounding box and are never fitted to opacity pixels. `Camera SPM` and `Camera Name` are explicit inputs; the Color texture stem is not used to guess either one. Before geometry is changed, the operator reads Atlas' public `cluster_card_pipeline.read_uv_template_contract` wrapper from that camera SPM and the explicit tree SPM, then proves the selected Color map is the material contract's Color path. It verifies the camera/material/Cutout payload against the normalization manifest and the validated reference `.blend` hash. Exact reference objects are appended into `Atlas_Camera_Reference`, outside both `Export` and the plan collection. A NumPy closed-loop similarity fit maps each new normalized outline to its corresponding exact camera boundary with the normalized attachment origin constrained exactly to the camera contract's `source_plane_xy`. The origin is forced as a CDT vertex and its UV is pinned to the contract's `pivot_uv`; all other boundary/interior UVs are transferred without clamping the source overscan. Delivery validation independently repeats the camera-boundary transfer and deterministic CDT rebuild from the external contract, rejects non-triangle/non-manifold cards, and does not accept a modified `result_uvs` payload merely because its stored hash was updated too.
 
-Variant pairing is also explicit. Every populated deform bone must end in `*_N_Start`, have its direct matching `*_N_End` child, and use unique consecutive ordinals `1..N`. Those ordinals must match the camera plane suffixes (`_01`, `_02`, ...); missing or ambiguous numbers stop the build instead of guessing a zip order.
+Variant pairing is also explicit. Every populated deform bone must be a complete `*_N_Start` axis bone (its own tail is the endpoint); legacy inputs may instead provide a direct matching `*_N_End` child or a validated orphan `*_N_End` marker. Ordinals must be unique and consecutive `1..N`, and must match the camera plane suffixes (`_01`, `_02`, ...); missing or ambiguous numbers stop the build instead of guessing a zip order.
 
 Production delivery uses one physical XML root per normalized prototype (`PER_CONNECTED_DEFORM_CLUSTER`, or the equivalent proven per-root layout). Legacy whole-mesh and composite shared-frame requests fail closed because they cannot preserve independent attachment roots without introducing a second pivot convention.
 
-The full contract and all relevant camera/reference/Color/Opacity hashes are persisted on the Scene and generated plans. This is also the supported rebuild path after Atlas adopts the source material and deletes the old embedded cutout IDs: the saved contract is reused only when every independent camera/reference/texture hash still validates. Missing or stale camera evidence cancels the operator before normalized geometry is built. Persisted-map validation accepts SpeedTree's `0 x 0` size rewrite only when both the current and snapshotted map are disabled; enabled maps, including active Color/Opacity, must retain the exact contract size, filename, path, and content hash.
+The full contract and all relevant camera/reference/texture hashes are persisted on the Scene and generated plans. A SpeedTree Camera Export is accepted only through Batch Tools' request/finalize receipt: the request freezes the camera SPM, camera transform/GUID, material, resolution, external mesh dependencies, and the Color/Opacity fingerprints used by the plan. Finalization requires Color and Opacity to have been rewritten after the request while the SPM and dependencies remain unchanged; Normal/Gloss/Subsurface/AO/Height outputs remain optional evidence. The actual image export remains SpeedTree's Camera Export action because Modeler 10.1 has no camera-image command-line export. On first normalization without a valid receipt, the add-on writes `*_capture_request.json` beside the normalization manifest and stops with the exact path. After Camera Export, running normalization again finalizes the receipt automatically. This is also the supported rebuild path after Atlas adopts the source material and deletes the old embedded cutout IDs.
 
-After the camera contract preflight and geometry transaction, the add-on calls Atlas Leaf Mesh Builder's public integration API to fill the existing collection, texture, target SPM, Generator Source Mapping, and mesh-scale fields. `Atlas Mesh Scale` defaults to `1.0`, preserving the normalized 3D/plan size relationship. The handoff explicitly adopts the existing source material (for example `M_branch_elm_01`) in place instead of creating a separate `_plan` material; Atlas snapshots the original cutouts for reversible removal. It also builds the real Color + Opacity preview material. Texture nodes use `CLIP`, while the exact UV payload remains unclamped. A post-build configuration failure is reported as a warning without discarding committed geometry. The actual SPM update remains Atlas' `Build/Update Target SPMs` operation.
+After the camera contract preflight and geometry transaction, the add-on calls Atlas Leaf Mesh Builder's public integration API to fill the existing collection, texture, target SPM, Generator Source Mapping, and two separate scale fields. The canonical adapter bakes the effective `0.01` unit conversion into the generated SpeedTree-only FBX geometry and writes `SpeedTree Mesh Asset Scale=1.0`. This preserves the same effective size while avoiding generator-dependent FBX export behavior for Mesh Asset Scale. The normalized 3D source, its plan, pivots, UVs, and Send to Unreal assets remain in their shared canonical cluster space. The handoff explicitly adopts the existing source material (for example `M_branch_elm_01`) in place instead of creating a separate `_plan` material; Atlas snapshots the original cutouts for reversible removal. It also builds the real Color + Opacity preview material and reloads same-path texture updates. The actual SPM update remains Atlas' `Build/Update Target SPMs` operation.
+
+The handoff also requests Atlas' explicit `ensure_all_material_cutouts` generator policy. Every normalized `01/02/03...` cutout must be referenced by a real Frond/Leaf generator Material+Mesh child slot; merely listing a mesh under `SupplementalCutoutMeshIDs` is rejected. This keeps branch, leaf, and side on the same scalable rule while preserving authored duplicate slots that intentionally weight a variation.
 
 ## Package
 

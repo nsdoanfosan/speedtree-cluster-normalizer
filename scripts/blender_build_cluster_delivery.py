@@ -95,6 +95,7 @@ def main():
             )
 
     props = bpy.context.scene.speedtree_cluster_normalizer
+    props.workflow_mode = "LEGACY_CAMERA_UV"
     props.source_object = source
     props.source_partition_mode = args.source_partition_mode
     props.whole_mesh_pivot_object = pivot
@@ -115,7 +116,8 @@ def main():
     props.atlas_camera_name = args.camera_name
     props.atlas_target_spm = str(target_spm)
     props.atlas_only_target = True
-    props.atlas_mesh_scale = 1.0
+    props.atlas_mesh_scale = 0.01
+    props.atlas_mesh_asset_scale = 1.0
 
     bpy.context.view_layer.objects.active = source
     source.select_set(True)

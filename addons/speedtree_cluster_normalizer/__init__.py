@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SpeedTree Cluster Normalizer",
     "author": "Codex for PARK",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Cluster Normalize",
     "description": "Normalize skinned SpeedTree cluster parts and build covering plans.",
@@ -17,6 +17,9 @@ import bpy
 _SUBMODULE_NAMES = (
     "attachment_contract",
     "normalization",
+    "capture_bake",
+    "unit_contract",
+    "cluster_handoff",
     "props",
     "atlas_handoff",
     "operators",
@@ -37,10 +40,16 @@ def _load_submodules():
 _modules = _load_submodules()
 STCLUSTER_Properties = _modules["props"].STCLUSTER_Properties
 STCLUSTER_OT_build = _modules["operators"].STCLUSTER_OT_build
+STCLUSTER_OT_bake_capture_maps = _modules["operators"].STCLUSTER_OT_bake_capture_maps
 STCLUSTER_PT_panel = _modules["operators"].STCLUSTER_PT_panel
 
 
-classes = (STCLUSTER_Properties, STCLUSTER_OT_build, STCLUSTER_PT_panel)
+classes = (
+    STCLUSTER_Properties,
+    STCLUSTER_OT_build,
+    STCLUSTER_OT_bake_capture_maps,
+    STCLUSTER_PT_panel,
+)
 
 
 def unregister_class_if_registered(class_name):

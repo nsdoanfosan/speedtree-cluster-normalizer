@@ -12,6 +12,8 @@ CAMERA_REFERENCE_COLLECTION = "Atlas_Camera_Reference"
 CAMERA_CONTRACT_KEY = "speedtree_cluster_camera_uv_contract"
 CAMERA_CONTRACT_HASH_KEY = "speedtree_cluster_camera_uv_contract_sha256"
 CAMERA_BUNDLE_KEY = "speedtree_cluster_camera_uv_bundle"
+CANONICAL_SPEEDTREE_EFFECTIVE_MESH_SCALE = 0.01
+GENERATOR_VARIANT_POLICY = "ensure_all_material_cutouts"
 
 
 def _read_external_camera_contract(reader, *args, camera_name, **kwargs):
@@ -157,6 +159,21 @@ def _validate_reference_artifacts(contract, reference_blend, manifest_path, vali
     }
 
 
+def _ensure_capture_receipt(contract, camera_spm, manifest_path):
+    from atlas_leaf_mesh_builder.integration_api import (
+        ensure_external_camera_capture_refresh,
+    )
+
+    try:
+        return ensure_external_camera_capture_refresh(
+            contract,
+            str(camera_spm),
+            str(manifest_path),
+        )
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _persisted_contract_bundle(
     scene,
     *,
@@ -209,13 +226,6 @@ def _persisted_contract_bundle(
     )
     if not _same_path(color_path, albedo):
         raise ValueError("Persisted camera UV contract Color map selection mismatch.")
-    for label, path, hash_key in (
-        ("Color map", color_path, "albedo_sha256"),
-        ("Opacity map", opacity_path, "opacity_sha256"),
-    ):
-        expected = str(persisted.get(hash_key) or "")
-        if not expected or _sha256(path) != expected:
-            raise ValueError(f"Persisted camera UV contract {label} hash is stale.")
     reference_blend = _required_file(
         persisted.get("reference_blend"), "Persisted camera reference blend", ".blend"
     )
@@ -225,17 +235,53 @@ def _persisted_contract_bundle(
     validation_path = _required_file(
         persisted.get("validation_path"), "Persisted camera validation", ".json"
     )
+    capture = _ensure_capture_receipt(contract, camera_spm, manifest_path)
+    contract = capture["contract"]
+    material = contract.get("material") or {}
+    color_path = _required_file(
+        material.get("maps", {}).get("Color", {}).get("path"),
+        "Receipt-backed contract Color map",
+    )
+    opacity_path = _required_file(
+        material.get("maps", {}).get("Opacity", {}).get("path"),
+        "Receipt-backed contract Opacity map",
+    )
+    if not _same_path(color_path, albedo):
+        raise ValueError("Receipt-backed camera contract Color map selection mismatch.")
     artifacts = _validate_reference_artifacts(
         contract, reference_blend, manifest_path, validation_path
     )
     expected_artifact_hashes = {
         "reference_blend_sha256": artifacts["reference_blend_sha256"],
-        "manifest_sha256": artifacts["manifest_sha256"],
         "validation_sha256": artifacts["validation_sha256"],
     }
     for key, actual in expected_artifact_hashes.items():
         if str(persisted.get(key) or "").casefold() != actual:
             raise ValueError(f"Persisted camera artifact hash is stale: {key}")
+    expected_hash = _canonical_sha256(contract)
+    persisted.update(
+        {
+            "contract_sha256": expected_hash,
+            "albedo_sha256": _sha256(color_path),
+            "opacity_sha256": _sha256(opacity_path),
+            "manifest_sha256": artifacts["manifest_sha256"],
+            "camera_capture_receipt_path": capture["receipt_path"],
+            "camera_capture_receipt_sha256": capture["receipt"][
+                "receipt_sha256"
+            ],
+        }
+    )
+    scene[CAMERA_CONTRACT_KEY] = json.dumps(
+        contract,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    scene[CAMERA_CONTRACT_HASH_KEY] = expected_hash
+    scene[CAMERA_BUNDLE_KEY] = json.dumps(
+        persisted,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     return {
         **persisted,
         "contract": contract,
@@ -316,6 +362,44 @@ def _validate_adopted_material_map(
         "size_policy": size_policy,
         "resolved_texture": str(resolved_texture),
     }
+
+
+def _generator_mesh_coverage(root, material_id):
+    """Return generator Material/Mesh slots that actively use one material."""
+    material_id = int(material_id)
+    slots = []
+    for generator in root.iter("Generator"):
+        properties = generator.find("Properties")
+        if properties is None:
+            continue
+        by_name = {
+            str(node.findtext("Name") or ""): node
+            for node in properties.findall("Property")
+        }
+        for name, material_node in by_name.items():
+            if not name.endswith(":Material"):
+                continue
+            prefix = name[: -len(":Material")]
+            mesh_node = by_name.get(prefix + ":Mesh")
+            if mesh_node is None:
+                continue
+            try:
+                slot_material_id = int(material_node.findtext("Value"))
+                slot_mesh_id = int(mesh_node.findtext("Value"))
+            except (TypeError, ValueError):
+                continue
+            if slot_material_id != material_id:
+                continue
+            slots.append(
+                {
+                    "generator_name": str(generator.findtext("Name") or ""),
+                    "generator_type": str(generator.attrib.get("Type") or ""),
+                    "slot_prefix": prefix,
+                    "material_id": slot_material_id,
+                    "mesh_id": slot_mesh_id,
+                }
+            )
+    return slots
 
 
 def _validate_adopted_target_spm(
@@ -426,6 +510,25 @@ def _validate_adopted_target_spm(
     ]
     if len(materials) != 1 or spm_material_mesh_ids(materials[0]) != generated_ids:
         raise ValueError("Adopted target material/mesh lineage does not match its manifest.")
+    generator_slots = _generator_mesh_coverage(root, material_id)
+    covered_generated_ids = sorted(
+        {
+            int(row["mesh_id"])
+            for row in generator_slots
+            if int(row["mesh_id"]) in set(generated_ids)
+        }
+    )
+    if covered_generated_ids != sorted(generated_ids):
+        missing = sorted(set(generated_ids).difference(covered_generated_ids))
+        raise ValueError(
+            "Adopted target generators do not actively reference every normalized "
+            f"variation: missing Mesh IDs {missing}."
+        )
+    connection = manifest.get("generator_connection") or {}
+    if connection.get("generator_variant_policy") != GENERATOR_VARIANT_POLICY:
+        raise ValueError(
+            "Adopted target manifest does not prove the normalized generator-variation policy."
+        )
     current_material = materials[0]
     original_material = decode_spm_node_snapshot(adoption["original_material_snapshot"])
     contract_material = persisted["contract"]["material"]
@@ -467,17 +570,47 @@ def _validate_adopted_target_spm(
         manifest.get("meshes") or [],
         key=lambda row: int(row.get("source_ordinal") or 0),
     )
+    try:
+        manifest_mesh_geometry_scale = float(manifest.get("mesh_geometry_scale"))
+        manifest_mesh_asset_scale = float(manifest.get("mesh_asset_scale"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Adopted target manifest has no complete SpeedTree mesh scale contract."
+        ) from exc
+    manifest_effective_mesh_scale = (
+        manifest_mesh_geometry_scale * manifest_mesh_asset_scale
+    )
+    if not math.isclose(
+        manifest_effective_mesh_scale,
+        CANONICAL_SPEEDTREE_EFFECTIVE_MESH_SCALE,
+        rel_tol=0.0,
+        abs_tol=1.0e-9,
+    ):
+        raise ValueError(
+            "Adopted target manifest effective SpeedTree mesh scale is not "
+            "the canonical 0.01."
+        )
     if len(manifest_meshes) != len(generated_ids):
         raise ValueError("Adopted target manifest mesh lineage count mismatch.")
     for mesh_id, row in zip(generated_ids, manifest_meshes):
         node = mesh_nodes.get(mesh_id)
         filename = str(node.findtext("Filename") or "") if node is not None else ""
         resolved_asset = (tree_spm.parent / filename).resolve() if filename else None
+        try:
+            node_mesh_asset_scale = float(node.findtext("Scale")) if node is not None else None
+        except (TypeError, ValueError):
+            node_mesh_asset_scale = None
         if (
             node is None
             or str(node.findtext("Embedded") or "").casefold() != "false"
             or str(node.findtext("PivotStyle") or "") != "0"
-            or str(node.findtext("Scale") or "") != "1"
+            or node_mesh_asset_scale is None
+            or not math.isclose(
+                node_mesh_asset_scale,
+                manifest_mesh_asset_scale,
+                rel_tol=0.0,
+                abs_tol=1.0e-9,
+            )
             or resolved_asset is None
             or not _same_path(resolved_asset, row.get("asset", ""))
             or not resolved_asset.is_file()
@@ -490,6 +623,8 @@ def _validate_adopted_target_spm(
         "adopted_generated_mesh_ids": generated_ids,
         "adopted_original_mesh_ids": expected_original_ids,
         "adopted_material_maps": validated_maps,
+        "adopted_generator_variant_policy": GENERATOR_VARIANT_POLICY,
+        "adopted_generator_slots": generator_slots,
     }
 
 
@@ -598,6 +733,16 @@ def resolve_camera_uv_contract(props, output_prefix):
         "Camera Blender validation",
         ".json",
     )
+    capture = _ensure_capture_receipt(contract, camera_spm, manifest_path)
+    contract = capture["contract"]
+    color_path = _required_file(
+        contract.get("material", {}).get("maps", {}).get("Color", {}).get("path"),
+        "Receipt-backed contract Color map",
+    )
+    opacity_path = _required_file(
+        contract.get("material", {}).get("maps", {}).get("Opacity", {}).get("path"),
+        "Receipt-backed contract Opacity map",
+    )
     artifacts = _validate_reference_artifacts(
         contract,
         reference_blend,
@@ -620,6 +765,8 @@ def resolve_camera_uv_contract(props, output_prefix):
         "manifest_sha256": artifacts["manifest_sha256"],
         "validation_path": str(validation_path),
         "validation_sha256": artifacts["validation_sha256"],
+        "camera_capture_receipt_path": capture["receipt_path"],
+        "camera_capture_receipt_sha256": capture["receipt"]["receipt_sha256"],
         "tree_file_changed_since_reference_build": artifacts[
             "tree_file_changed_since_reference_build"
         ],
@@ -643,7 +790,55 @@ def _assign_preview_material(collection_names, material):
     return sorted(set(assigned))
 
 
-def prepare_atlas_handoff(context, props, plan_collection, uv_bundle=None):
+def load_verified_unit_probe_contract(path, target_meters):
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        raise ValueError(
+            "Physical Direct Capture requires a verified Blender-to-SpeedTree "
+            "unit-probe receipt before production handoff."
+        )
+    resolved = Path(bpy.path.abspath(raw_path)).expanduser().absolute()
+    if not resolved.is_file():
+        raise FileNotFoundError(
+            f"Verified unit-probe receipt does not exist: {resolved}"
+        )
+    try:
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Verified unit-probe receipt is not valid JSON: {exc}"
+        ) from exc
+    if not _enable_atlas_addon():
+        raise RuntimeError(
+            "Atlas Leaf Mesh Builder must be installed to validate the "
+            "production unit-probe receipt."
+        )
+    from atlas_leaf_mesh_builder.unit_contract import validate_unit_probe_contract
+
+    verified = validate_unit_probe_contract(value)
+    if abs(float(verified["physical_target_meters"]) - float(target_meters)) > max(
+        abs(float(target_meters)) * 1.0e-6,
+        1.0e-9,
+    ):
+        raise ValueError(
+            "Verified unit-probe target does not match the Blender physical "
+            f"capture target ({verified['physical_target_meters']} m vs "
+            f"{float(target_meters)} m)."
+        )
+    return {
+        **verified,
+        "receipt_path": str(resolved),
+        "receipt_file_sha256": _sha256(resolved),
+    }
+
+
+def prepare_atlas_handoff(
+    context,
+    props,
+    plan_collection,
+    uv_bundle=None,
+    unit_probe_contract=None,
+):
     if not _enable_atlas_addon():
         return {
             "available": False,
@@ -664,9 +859,15 @@ def prepare_atlas_handoff(context, props, plan_collection, uv_bundle=None):
         albedo_path=props.atlas_albedo_path,
         target_spm=props.atlas_target_spm,
         source_material_id=(props.source_material_id or None),
-        adopt_source_material=True,
+        adopt_source_material=(
+            str(props.plan_material_name or "").strip()
+            == str(props.source_material_name or "").strip()
+        ),
         only_target=props.atlas_only_target,
         mesh_geometry_scale=props.atlas_mesh_scale,
+        mesh_asset_scale=props.atlas_mesh_asset_scale,
+        generator_variant_policy=GENERATOR_VARIANT_POLICY,
+        unit_probe_contract=unit_probe_contract,
     )
     if uv_bundle is not None:
         uv_bundle["atlas_export_scope_id"] = configured["export_scope_id"]
@@ -697,5 +898,9 @@ def prepare_atlas_handoff(context, props, plan_collection, uv_bundle=None):
         "camera_uv_contract_sha256": (
             uv_bundle["contract_sha256"] if uv_bundle is not None else None
         ),
+        "unit_probe_contract_sha256": configured.get(
+            "unit_probe_contract_sha256"
+        ),
+        "unit_scale_location": configured.get("unit_scale_location"),
         "preview_material": preview,
     }

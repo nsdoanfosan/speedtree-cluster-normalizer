@@ -20,7 +20,12 @@ from .atlas_handoff import (
     _same_path,
     _validate_reference_artifacts,
 )
-from .attachment_contract import _parse_speedtree_xml
+from .attachment_contract import (
+    GEOMETRY_SUPPORTED_ATTACHMENT_POLICY,
+    _parse_speedtree_xml,
+    attachment_endpoint_world,
+    attachment_origin_world,
+)
 from .normalization import (
     ASSET_ROLE_KEY,
     CARD_PROTOTYPE_MAP_HASH_KEY,
@@ -32,6 +37,15 @@ from .normalization import (
     PROJECTION_COVERAGE_KEY,
     PROTOTYPE_ASSET_KEY,
     PROTOTYPE_INDEX_KEY,
+    DIRECT_CAPTURE_UV_KEY,
+    DIRECT_CAPTURE_UV_SOURCE,
+    PHYSICAL_CAPTURE_ALIGNED_FRAME_POLICY,
+    PHYSICAL_CAPTURE_DIRECTION_CAPTURE_UP_FALLBACK,
+    PHYSICAL_CAPTURE_DIRECTION_PROJECTED_XML,
+    PHYSICAL_CAPTURE_CONTRACT_HASH_KEY,
+    PHYSICAL_CAPTURE_CONTRACT_KEY,
+    physical_capture_projection_tolerance,
+    ROOT_BRIDGE_MAX_GAP_RATIO,
     SOURCE_PARTITION_MODE_KEY,
     SOURCE_3D_CONTRACT_HASH_KEY,
     SOURCE_3D_CONTRACT_KEY,
@@ -43,6 +57,7 @@ from .normalization import (
     UV_TRANSFER_MAX_NORMALIZED_ATTACHMENT_ERROR,
     UV_TRANSFER_MAX_NORMALIZED_RMS,
     _canonical_sha256,
+    _validate_physical_capture_contract,
     _transfer_camera_boundary_uvs,
     _uniform_plan_triangulation,
     _ordered_boundary_indices,
@@ -51,6 +66,45 @@ from .normalization import (
 
 
 EXPECTED_TRANSFER_POLICY = "closed_loop_similarity_to_exact_camera_reference_boundary"
+AUTO_CAPTURE_CONTRACT_KEY = "speedtree_cluster_auto_capture_contract"
+AUTO_CAPTURE_CONTRACT_HASH_KEY = "speedtree_cluster_auto_capture_contract_sha256"
+AUTO_CAPTURE_COLLECTION = "Atlas_Auto_Capture"
+AUTO_CAPTURE_KIND = "speedtree_cluster_blender_auto_capture_contract"
+AUTO_CAPTURE_MANIFEST_KIND = "speedtree_cluster_blender_auto_capture"
+AUTO_CAPTURE_UV_POLICY = "direct_world_axis_capture_projection"
+AUTO_CAPTURE_MAP_ROLES = (
+    "Color",
+    "Opacity",
+    "Normal",
+    "Gloss",
+    "SubsurfaceColor",
+    "SubsurfaceAmount",
+    "AO",
+    "Height",
+)
+AUTO_CAPTURE_BASES = {
+    "XY": {
+        "right": (1.0, 0.0, 0.0),
+        "up": (0.0, 1.0, 0.0),
+        "normal": (0.0, 0.0, 1.0),
+        "view_direction": (0.0, 0.0, -1.0),
+        "rotation_degrees": 0.0,
+    },
+    "XZ": {
+        "right": (1.0, 0.0, 0.0),
+        "up": (0.0, 0.0, 1.0),
+        "normal": (0.0, -1.0, 0.0),
+        "view_direction": (0.0, 1.0, 0.0),
+        "rotation_degrees": 90.0,
+    },
+    "YZ": {
+        "right": (0.0, 1.0, 0.0),
+        "up": (0.0, 0.0, 1.0),
+        "normal": (1.0, 0.0, 0.0),
+        "view_direction": (-1.0, 0.0, 0.0),
+        "rotation_degrees": 90.0,
+    },
+}
 _TOLERANCE = 1.0e-6
 _UV_TOLERANCE = 1.0e-7
 
@@ -140,6 +194,86 @@ def _validate_xml_attachment(value, label):
         or end_error > tolerance + _TOLERANCE
     ):
         raise ValueError(f"{label} match error exceeds its contract.")
+    effective_keys = {
+        "effective_attachment_world",
+        "effective_endpoint_world",
+        "effective_support_distance_world",
+        "effective_direction_length_world",
+        "effective_geometry_scale_world",
+        "effective_support_min_projection_world",
+        "effective_support_max_projection_world",
+        "effective_support_tolerance_world",
+        "effective_attachment_policy",
+    }
+    present_effective_keys = effective_keys.intersection(value)
+    if present_effective_keys and present_effective_keys != effective_keys:
+        raise ValueError(f"{label} geometry-supported attachment is incomplete.")
+    if present_effective_keys:
+        effective_start = Vector(
+            _finite_vector(
+                value["effective_attachment_world"],
+                3,
+                f"{label} effective start",
+            )
+        )
+        effective_end = Vector(
+            _finite_vector(
+                value["effective_endpoint_world"],
+                3,
+                f"{label} effective end",
+            )
+        )
+        xml_start = Vector(start)
+        xml_end = Vector(end)
+        xml_direction = xml_end - xml_start
+        xml_length = xml_direction.length
+        axis = xml_direction / xml_length
+        support_distance = float(value["effective_support_distance_world"])
+        direction_length = float(value["effective_direction_length_world"])
+        geometry_scale = float(value["effective_geometry_scale_world"])
+        minimum_projection = float(
+            value["effective_support_min_projection_world"]
+        )
+        maximum_projection = float(
+            value["effective_support_max_projection_world"]
+        )
+        support_tolerance = float(value["effective_support_tolerance_world"])
+        if (
+            value["effective_attachment_policy"]
+            != GEOMETRY_SUPPORTED_ATTACHMENT_POLICY
+            or not all(
+                math.isfinite(item)
+                for item in (
+                    support_distance,
+                    direction_length,
+                    geometry_scale,
+                    minimum_projection,
+                    maximum_projection,
+                    support_tolerance,
+                )
+            )
+            or support_distance < 0.0
+            or support_distance > xml_length + _TOLERANCE
+            or direction_length <= 0.0
+            or direction_length
+            > min(xml_length - support_distance, geometry_scale) + _TOLERANCE
+            or geometry_scale <= 0.0
+            or minimum_projection > maximum_projection
+            or support_tolerance <= 0.0
+            or (
+                effective_start
+                - (xml_start + axis * support_distance)
+            ).length
+            > _TOLERANCE
+            or (
+                effective_end
+                - (effective_start + axis * direction_length)
+            ).length
+            > _TOLERANCE
+        ):
+            raise ValueError(
+                f"{label} geometry-supported attachment evidence is invalid."
+            )
     return value
 
 
@@ -273,6 +407,13 @@ def _validate_external_camera_uv(plan, plane, camera, actual_uvs, transfer):
         2,
         "camera contract pivot UV",
     )
+    root_lock = transfer.get("plan_root_lock") or {}
+    try:
+        containment_tolerance = float(root_lock["tolerance"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Plan root-lock containment tolerance is invalid: {plan.name}"
+        ) from exc
     (
         expected_vertices,
         expected_uvs,
@@ -284,6 +425,7 @@ def _validate_external_camera_uv(plan, plane, camera, actual_uvs, transfer):
         refinement_levels,
         attachment_point=(0.0, 0.0),
         attachment_uv=pivot_uv,
+        containment_tolerance=containment_tolerance,
     )
     if len(expected_vertices) != len(plan.data.vertices):
         raise ValueError(f"Plan CDT vertex count differs from canonical rebuild: {plan.name}")
@@ -605,6 +747,302 @@ def _validate_material(
     return material
 
 
+def _vectors_close(actual, expected, tolerance=_TOLERANCE):
+    try:
+        left = Vector(actual)
+        right = Vector(expected)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Auto capture basis contains an invalid vector.") from exc
+    return len(left) == len(right) and (left - right).length <= tolerance
+
+
+def _validate_auto_capture_frame(contract, manifest):
+    frame = contract.get("frame") or {}
+    manifest_frame = manifest.get("frame") or {}
+    if frame != manifest_frame:
+        raise ValueError("Auto capture contract frame differs from its manifest.")
+    if frame.get("policy") != "world_axis_locked_auto_bounds":
+        raise ValueError("Auto capture frame is not world-axis locked.")
+    plane = str(frame.get("plane") or "").upper()
+    expected = AUTO_CAPTURE_BASES.get(plane)
+    if expected is None:
+        raise ValueError(f"Auto capture uses an unsupported plane: {plane!r}")
+    for key in ("right", "up", "normal", "view_direction"):
+        if not _vectors_close(frame.get(key), expected[key], 1.0e-9):
+            raise ValueError(
+                f"Auto capture {plane} {key} is tilted or points along another axis."
+            )
+    rotation = float(frame.get("rotation_degrees", math.nan))
+    if (
+        not math.isfinite(rotation)
+        or abs(rotation - float(expected["rotation_degrees"])) > 1.0e-9
+    ):
+        raise ValueError(
+            f"Auto capture {plane} rotation must be exactly "
+            f"{expected['rotation_degrees']:.1f} degrees."
+        )
+    right = Vector(frame["right"])
+    up = Vector(frame["up"])
+    normal = Vector(frame["normal"])
+    view = Vector(frame["view_direction"])
+    orthogonality = max(
+        abs(right.dot(up)),
+        abs(right.dot(normal)),
+        abs(up.dot(normal)),
+    )
+    handedness = right.cross(up).dot(normal)
+    if (
+        orthogonality > 1.0e-9
+        or abs(handedness - 1.0) > 1.0e-9
+        or (view + normal).length > 1.0e-9
+    ):
+        raise ValueError("Auto capture frame is not an orthogonal right-handed basis.")
+    stored_orthogonality = float(
+        frame.get("orthogonality_error", math.nan)
+    )
+    if (
+        not math.isfinite(stored_orthogonality)
+        or abs(stored_orthogonality - orthogonality) > 1.0e-9
+    ):
+        raise ValueError("Auto capture orthogonality evidence is stale.")
+    if "handedness" in frame and (
+        abs(float(frame.get("handedness", math.nan)) - handedness) > 1.0e-9
+    ):
+        raise ValueError("Auto capture handedness evidence is stale.")
+    width = float(frame.get("width", math.nan))
+    height = float(frame.get("height", math.nan))
+    content_width = float(frame.get("content_width", math.nan))
+    content_height = float(frame.get("content_height", math.nan))
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (width, height, content_width, content_height)
+        )
+        or min(width, height, content_width, content_height) <= 0.0
+        or abs(width - height) > _TOLERANCE
+        or content_width > width + _TOLERANCE
+        or content_height > height + _TOLERANCE
+    ):
+        raise ValueError("Auto capture square area dimensions are invalid.")
+    center = Vector(_finite_vector(frame.get("center"), 3, "capture center"))
+    camera_location = Vector(
+        _finite_vector(frame.get("camera_location"), 3, "capture camera location")
+    )
+    camera_delta = camera_location - center
+    if (
+        camera_delta.dot(normal) <= 0.0
+        or (camera_delta - normal * camera_delta.dot(normal)).length > _TOLERANCE
+    ):
+        raise ValueError("Auto capture camera is not centered on its locked normal.")
+    resolution = contract.get("resolution")
+    if (
+        resolution != manifest.get("resolution")
+        or not isinstance(resolution, list)
+        or len(resolution) != 2
+        or any(int(value) <= 0 for value in resolution)
+        or int(resolution[0]) != int(resolution[1])
+    ):
+        raise ValueError("Auto capture resolution is not a valid square contract.")
+    return {
+        "plane": plane,
+        "right": right,
+        "up": up,
+        "normal": normal,
+        "view": view,
+        "center": center,
+        "camera_location": camera_location,
+        "width": width,
+        "height": height,
+        "rotation_degrees": rotation,
+        "orthogonality_error": orthogonality,
+        "handedness": handedness,
+    }
+
+
+def _validate_auto_capture_maps(contract, manifest, expected_albedo_path=None):
+    map_rows = manifest.get("maps") or []
+    if len(map_rows) != len(AUTO_CAPTURE_MAP_ROLES):
+        raise ValueError("Auto capture manifest does not contain exactly eight maps.")
+    by_role = {}
+    for row in map_rows:
+        role = str(row.get("role") or "")
+        if role in by_role:
+            raise ValueError(f"Auto capture manifest duplicates map role: {role}")
+        path = Path(str(row.get("path") or "")).expanduser().absolute()
+        expected_hash = str(row.get("sha256") or "")
+        expected_size = int(row.get("size", -1))
+        if (
+            role not in AUTO_CAPTURE_MAP_ROLES
+            or not path.is_file()
+            or not expected_hash
+            or _sha256(path) != expected_hash
+            or path.stat().st_size != expected_size
+        ):
+            raise ValueError(f"Auto capture map fingerprint is stale: {role or '<empty>'}")
+        by_role[role] = {
+            "path": path,
+            "sha256": expected_hash,
+            "size": expected_size,
+        }
+    if set(by_role) != set(AUTO_CAPTURE_MAP_ROLES):
+        raise ValueError("Auto capture manifest map roles are incomplete.")
+    color_path = Path(str(contract.get("color") or "")).expanduser().absolute()
+    opacity_path = Path(str(contract.get("opacity") or "")).expanduser().absolute()
+    for role, path in (("Color", color_path), ("Opacity", opacity_path)):
+        if (
+            not path.is_file()
+            or _sha256(path) != by_role[role]["sha256"]
+        ):
+            raise ValueError(
+                f"Auto capture promoted {role} map differs from the captured map."
+            )
+    if (
+        expected_albedo_path is not None
+        and not _same_path(color_path, expected_albedo_path)
+    ):
+        raise ValueError("Explicit Atlas Color map differs from auto capture.")
+    return color_path, opacity_path, by_role
+
+
+def _validate_auto_capture_material(material_name, color_path, opacity_path):
+    material = bpy.data.materials.get(material_name)
+    if material is None or not material.use_nodes or material.node_tree is None:
+        raise ValueError(f"Auto capture preview material is missing: {material_name}")
+    color = material.node_tree.nodes.get("SpeedTree Color")
+    opacity = material.node_tree.nodes.get("SpeedTree Opacity")
+    if (
+        color is None
+        or opacity is None
+        or color.type != "TEX_IMAGE"
+        or opacity.type != "TEX_IMAGE"
+        or color.image is None
+        or opacity.image is None
+    ):
+        raise ValueError(
+            "Auto capture material must contain real Color and Opacity image nodes."
+        )
+    if color.extension != "CLIP" or opacity.extension != "CLIP":
+        raise ValueError("Auto capture texture nodes must use CLIP.")
+    for node, expected_path, label in (
+        (color, color_path, "Color"),
+        (opacity, opacity_path, "Opacity"),
+    ):
+        actual_path = Path(
+            bpy.path.abspath(node.image.filepath)
+        ).expanduser().absolute()
+        if (
+            node.image.source != "FILE"
+            or not actual_path.is_file()
+            or not _same_path(actual_path, expected_path)
+        ):
+            raise ValueError(f"Auto capture {label} node uses another image.")
+    alpha_links = [
+        link
+        for link in material.node_tree.links
+        if link.from_node.name == opacity.name and link.to_socket.name == "Alpha"
+    ]
+    if not alpha_links:
+        raise ValueError("Auto capture Opacity node is not connected to material Alpha.")
+    return material
+
+
+def _curve_world_points(obj):
+    return [
+        obj.matrix_world @ Vector(point.co[:3])
+        for spline in obj.data.splines
+        for point in spline.points
+    ]
+
+
+def _validate_auto_capture_rig(scene, contract_hash, frame):
+    collection = bpy.data.collections.get(AUTO_CAPTURE_COLLECTION)
+    if collection is None or collection.children:
+        raise ValueError("Auto capture area collection is missing or nested.")
+    expected_names = {
+        "STAutoCapture_Camera",
+        "STAutoCapture_Area",
+        "STAutoCapture_AttachmentOrigin",
+    }
+    if {obj.name for obj in collection.objects} != expected_names:
+        raise ValueError("Auto capture area collection contains unexpected objects.")
+    camera = bpy.data.objects.get("STAutoCapture_Camera")
+    area = bpy.data.objects.get("STAutoCapture_Area")
+    origin = bpy.data.objects.get("STAutoCapture_AttachmentOrigin")
+    for obj, role in (
+        (camera, "camera"),
+        (area, "area"),
+        (origin, "attachment_origin"),
+    ):
+        if (
+            obj is None
+            or obj.get("speedtree_cluster_auto_capture_role") != role
+            or obj.get(AUTO_CAPTURE_CONTRACT_HASH_KEY) != contract_hash
+        ):
+            raise ValueError(f"Auto capture {role} object is missing or stale.")
+    if (
+        camera.type != "CAMERA"
+        or camera.data.type != "ORTHO"
+        or scene.camera is not camera
+        or abs(float(camera.data.ortho_scale) - frame["height"]) > _TOLERANCE
+    ):
+        raise ValueError("Auto capture orthographic camera contract is stale.")
+    camera_axes = (
+        Vector(camera.matrix_world.col[0][:3]),
+        Vector(camera.matrix_world.col[1][:3]),
+        Vector(camera.matrix_world.col[2][:3]),
+    )
+    if (
+        (camera_axes[0] - frame["right"]).length > _TOLERANCE
+        or (camera_axes[1] - frame["up"]).length > _TOLERANCE
+        or (camera_axes[2] - frame["normal"]).length > _TOLERANCE
+        or (camera.matrix_world.translation - frame["camera_location"]).length
+        > _TOLERANCE
+    ):
+        raise ValueError("Auto capture camera is tilted or displaced.")
+    if (
+        area.type != "CURVE"
+        or len(area.data.splines) != 1
+        or not area.data.splines[0].use_cyclic_u
+        or len(area.data.splines[0].points) != 4
+        or not _identity_object(area)
+    ):
+        raise ValueError("Auto capture area frame topology is invalid.")
+    half_width = frame["width"] * 0.5
+    half_height = frame["height"] * 0.5
+    expected_corners = [
+        frame["center"] - frame["right"] * half_width - frame["up"] * half_height,
+        frame["center"] + frame["right"] * half_width - frame["up"] * half_height,
+        frame["center"] + frame["right"] * half_width + frame["up"] * half_height,
+        frame["center"] - frame["right"] * half_width + frame["up"] * half_height,
+    ]
+    actual_corners = _curve_world_points(area)
+    if any(
+        (actual - expected).length > _TOLERANCE
+        for actual, expected in zip(actual_corners, expected_corners)
+    ):
+        raise ValueError("Auto capture area corners differ from the locked frame.")
+    if (
+        origin.type != "CURVE"
+        or len(origin.data.splines) != 2
+        or any(len(spline.points) != 2 for spline in origin.data.splines)
+        or not _identity_object(origin)
+    ):
+        raise ValueError("Auto capture attachment-origin marker is invalid.")
+    origin_points = _curve_world_points(origin)
+    if (
+        len(origin_points) != 4
+        or (origin_points[0] + origin_points[1]).length > _TOLERANCE
+        or (origin_points[2] + origin_points[3]).length > _TOLERANCE
+    ):
+        raise ValueError("Auto capture attachment-origin marker is not centered at 0,0,0.")
+    return {
+        "collection": collection.name,
+        "camera": camera.name,
+        "area": area.name,
+        "attachment_origin": origin.name,
+    }
+
+
 def _expected_export_from_plans(plans):
     skeletal_bases = []
     for plan in plans:
@@ -680,6 +1118,1055 @@ def _validate_export(scene, plans, references, expected_export_names=None):
     return sorted(derived_names)
 
 
+def validate_auto_capture_delivery(
+    scene,
+    plan_collection_name,
+    material_name,
+    *,
+    plan_base=None,
+    expected_export_names=None,
+    expected_tree_spm=None,
+    expected_albedo_path=None,
+    expected_card_count=None,
+    expected_prototype_count=None,
+):
+    """Validate a Blender world-axis capture delivery without legacy camera data."""
+    contract = _json_property(
+        scene,
+        AUTO_CAPTURE_CONTRACT_KEY,
+        "Scene auto capture contract",
+    )
+    contract_hash = str(scene.get(AUTO_CAPTURE_CONTRACT_HASH_KEY) or "")
+    if (
+        contract.get("kind") != AUTO_CAPTURE_KIND
+        or int(contract.get("version", 0)) != 1
+        or not contract_hash
+        or _canonical_sha256(contract) != contract_hash
+    ):
+        raise ValueError("Scene auto capture contract is missing, unsupported, or stale.")
+    for legacy_key in (
+        CAMERA_CONTRACT_KEY,
+        CAMERA_CONTRACT_HASH_KEY,
+        CAMERA_BUNDLE_KEY,
+    ):
+        if scene.get(legacy_key):
+            raise ValueError("Auto capture delivery contains an active legacy camera contract.")
+    for collection_name in ("Atlas_Capture_Sync", CAMERA_REFERENCE_COLLECTION):
+        if bpy.data.collections.get(collection_name) is not None:
+            raise ValueError(
+                f"Auto capture delivery contains a legacy camera collection: "
+                f"{collection_name}"
+            )
+
+    manifest_path = Path(
+        str(contract.get("capture_manifest") or "")
+    ).expanduser().absolute()
+    if (
+        not manifest_path.is_file()
+        or _sha256(manifest_path)
+        != str(contract.get("capture_manifest_sha256") or "")
+    ):
+        raise ValueError("Auto capture manifest is missing or stale.")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Auto capture manifest is invalid: {exc}") from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("kind") != AUTO_CAPTURE_MANIFEST_KIND
+        or int(manifest.get("version", 0)) != 1
+    ):
+        raise ValueError("Auto capture manifest kind/version is unsupported.")
+    blend_path = Path(bpy.data.filepath).expanduser().absolute()
+    if (
+        not blend_path.is_file()
+        or not _same_path(contract.get("source_blend", ""), blend_path)
+        or not _same_path(manifest.get("blend", ""), blend_path)
+    ):
+        raise ValueError("Auto capture contract targets another Blender file.")
+    source_collection_name = str(contract.get("source_collection") or "")
+    source_collection = bpy.data.collections.get(source_collection_name)
+    if (
+        not source_collection_name
+        or source_collection is None
+        or manifest.get("source_collection") != source_collection_name
+    ):
+        raise ValueError("Auto capture source collection is missing or changed.")
+    source_objects = {
+        obj.name: obj
+        for obj in _collection_objects_recursive(source_collection)
+        if obj.type == "MESH"
+    }
+    manifest_sources = manifest.get("source_objects") or []
+    if not manifest_sources:
+        raise ValueError("Auto capture manifest contains no source meshes.")
+    for row in manifest_sources:
+        source = source_objects.get(str(row.get("name") or ""))
+        if (
+            source is None
+            or len(source.data.vertices) != int(row.get("vertices", -1))
+            or len(source.data.polygons) != int(row.get("polygons", -1))
+        ):
+            raise ValueError(
+                f"Auto capture source mesh changed: {row.get('name') or '<empty>'}"
+            )
+
+    frame = _validate_auto_capture_frame(contract, manifest)
+    color_path, opacity_path, map_rows = _validate_auto_capture_maps(
+        contract,
+        manifest,
+        expected_albedo_path=expected_albedo_path,
+    )
+    material = _validate_auto_capture_material(
+        material_name,
+        color_path,
+        opacity_path,
+    )
+    rig = _validate_auto_capture_rig(scene, contract_hash, frame)
+    (
+        source_3d_contract,
+        source_3d_contract_hash,
+        source_3d_root_ids,
+        authoritative_source_3d_roots,
+    ) = _validate_source_3d_contract(scene)
+
+    plan_collection = bpy.data.collections.get(plan_collection_name)
+    if plan_collection is None or plan_collection.children:
+        raise ValueError("Auto capture plan collection is missing or nested.")
+    plans = [
+        obj
+        for obj in plan_collection.objects
+        if obj.type == "MESH"
+        and obj.get(ASSET_ROLE_KEY) == "speedtree_plan"
+    ]
+    if len(plans) != len(plan_collection.objects) or not plans:
+        raise ValueError("Auto capture plan collection contains unexpected objects.")
+    plans = sorted(plans, key=lambda obj: obj.name.casefold())
+    card_count = len(plans)
+    if (
+        expected_card_count is not None
+        and card_count != int(expected_card_count)
+    ):
+        raise ValueError("Auto capture plan count differs from the explicit expectation.")
+    if plan_base:
+        expected_plan_names = [
+            f"{plan_base}_{index:02d}"
+            for index in range(1, card_count + 1)
+        ]
+        if [plan.name for plan in plans] != expected_plan_names:
+            raise ValueError("Auto capture plan base/ordinal sequence is invalid.")
+
+    prototype_map = _json_property(
+        scene,
+        CARD_PROTOTYPE_MAP_KEY,
+        "card/prototype mapping contract",
+    )
+    prototype_map_hash = str(scene.get(CARD_PROTOTYPE_MAP_HASH_KEY) or "")
+    if (
+        not prototype_map_hash
+        or _canonical_sha256(prototype_map) != prototype_map_hash
+        or int(prototype_map.get("card_count", -1)) != card_count
+        or str(prototype_map.get("source_3d_contract_sha256") or "")
+        != source_3d_contract_hash
+    ):
+        raise ValueError("Auto capture card/prototype mapping is stale.")
+    mapping_rows = prototype_map.get("cards") or []
+    mapping_by_plan = {
+        str(row.get("plan") or ""): row
+        for row in mapping_rows
+    }
+    plan_names = {plan.name for plan in plans}
+    if (
+        len(mapping_rows) != card_count
+        or set(mapping_by_plan) != plan_names
+        or prototype_map.get("composite_parts")
+        or prototype_map.get("composite_set_id")
+    ):
+        raise ValueError("Auto capture requires one physical prototype per plan.")
+    prototype_assets = {
+        str(row.get("prototype_asset") or "")
+        for row in mapping_rows
+    }
+    if "" in prototype_assets:
+        raise ValueError("Auto capture mapping contains an empty prototype asset.")
+    prototype_count = len(prototype_assets)
+    if (
+        int(prototype_map.get("prototype_count", -1)) != prototype_count
+        or prototype_count != len(source_3d_root_ids)
+        or (
+            expected_prototype_count is not None
+            and prototype_count != int(expected_prototype_count)
+        )
+    ):
+        raise ValueError("Auto capture prototype count is stale.")
+
+    rows = []
+    seen_xml_root_ids = set()
+    for plan in plans:
+        mapping = mapping_by_plan[plan.name]
+        if (
+            not _identity_object(plan)
+            or plan.get(AUTO_CAPTURE_CONTRACT_HASH_KEY) != contract_hash
+            or plan.data.get(AUTO_CAPTURE_CONTRACT_HASH_KEY)
+            or plan.get("speedtree_cluster_uv_policy") != AUTO_CAPTURE_UV_POLICY
+            or plan.get(CAMERA_CONTRACT_HASH_KEY)
+            or plan.get(CAMERA_REFERENCE_KEY)
+            or plan.get(UV_TRANSFER_KEY)
+        ):
+            raise ValueError(f"Auto capture plan role/contract is stale: {plan.name}")
+        if [slot for slot in plan.data.materials] != [material]:
+            raise ValueError(
+                f"Auto capture plan does not use exactly {material_name}: {plan.name}"
+            )
+        plan_source_3d_contract = _json_property(
+            plan,
+            SOURCE_3D_CONTRACT_KEY,
+            f"source 3D contract on {plan.name}",
+        )
+        plan_attachment = _validate_xml_attachment(
+            _json_property(
+                plan,
+                XML_ATTACHMENT_KEY,
+                f"XML attachment on {plan.name}",
+            ),
+            f"XML attachment on {plan.name}",
+        )
+        root_id = int(plan_attachment["xml_bone_id"])
+        contract_root = next(
+            (
+                root
+                for root in authoritative_source_3d_roots
+                if int(root["xml_bone_id"]) == root_id
+            ),
+            None,
+        )
+        if (
+            plan_source_3d_contract != source_3d_contract
+            or contract_root is None
+            or not _attachment_matches_contract(plan_attachment, contract_root)
+            or root_id in seen_xml_root_ids
+            or root_id not in source_3d_root_ids
+            or int(mapping.get("xml_bone_id", -1)) != root_id
+            or int(mapping.get("prototype_index", -1))
+            != int(plan.get(PROTOTYPE_INDEX_KEY, -2))
+            or mapping.get("prototype_asset") != plan.get(PROTOTYPE_ASSET_KEY)
+            or mapping.get("prototype_asset") != plan.get(COUNTERPART_KEY)
+            or prototype_map.get("source_partition_mode")
+            != plan.get(SOURCE_PARTITION_MODE_KEY)
+        ):
+            raise ValueError(f"Auto capture XML/prototype lineage mismatch: {plan.name}")
+        seen_xml_root_ids.add(root_id)
+
+        try:
+            plan_frame = Matrix(json.loads(plan["speedtree_cluster_frame_world"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Auto capture plan frame is invalid: {plan.name}") from exc
+        plan_axes = (
+            Vector(plan_frame.col[0][:3]),
+            Vector(plan_frame.col[1][:3]),
+            Vector(plan_frame.col[2][:3]),
+        )
+        if (
+            (plan_axes[0] - frame["right"]).length > _TOLERANCE
+            or (plan_axes[1] - frame["up"]).length > _TOLERANCE
+            or (plan_axes[2] - frame["normal"]).length > _TOLERANCE
+            or (
+                plan_frame.translation
+                - attachment_origin_world(plan_attachment)
+            ).length
+            > _TOLERANCE
+        ):
+            raise ValueError(
+                f"Auto capture plan is tilted or detached from XML root: {plan.name}"
+            )
+        attachment_index = int(
+            plan.get("speedtree_cluster_attachment_vertex_index", -1)
+        )
+        if (
+            attachment_index < 0
+            or attachment_index >= len(plan.data.vertices)
+            or plan.data.vertices[attachment_index].co.length > _TOLERANCE
+        ):
+            raise ValueError(f"Auto capture plan pivot is not local 0,0,0: {plan.name}")
+
+        expected_uvs = []
+        for vertex in plan.data.vertices:
+            world = plan_frame @ vertex.co
+            relative = world - frame["center"]
+            expected_uvs.append(
+                [
+                    0.5 + float(relative.dot(frame["right"])) / frame["width"],
+                    0.5 + float(relative.dot(frame["up"])) / frame["height"],
+                ]
+            )
+        actual_uvs = _vertex_uvs(
+            plan.data,
+            expected_uvs=expected_uvs,
+            label=plan.name,
+        )
+        actual_minimum = [
+            min(uv[axis] for uv in actual_uvs)
+            for axis in range(2)
+        ]
+        actual_maximum = [
+            max(uv[axis] for uv in actual_uvs)
+            for axis in range(2)
+        ]
+        stored_bounds = _json_property(
+            plan,
+            "speedtree_cluster_auto_capture_uv_bounds",
+            f"auto capture UV bounds on {plan.name}",
+        )
+        stored_minimum = _finite_vector(
+            stored_bounds.get("minimum"),
+            2,
+            "stored auto capture UV minimum",
+        )
+        stored_maximum = _finite_vector(
+            stored_bounds.get("maximum"),
+            2,
+            "stored auto capture UV maximum",
+        )
+        if (
+            min(actual_minimum) < -_UV_TOLERANCE
+            or max(actual_maximum) > 1.0 + _UV_TOLERANCE
+            or max(
+                abs(actual_minimum[axis] - stored_minimum[axis])
+                for axis in range(2)
+            )
+            > _TOLERANCE
+            or max(
+                abs(actual_maximum[axis] - stored_maximum[axis])
+                for axis in range(2)
+            )
+            > _TOLERANCE
+        ):
+            raise ValueError(f"Auto capture plan UV bounds are stale: {plan.name}")
+
+        counterpart_name = str(plan.get(COUNTERPART_KEY) or "")
+        part = bpy.data.objects.get(counterpart_name + "_Mesh")
+        if part is None or part.type != "MESH":
+            raise ValueError(f"Auto capture counterpart mesh is missing: {plan.name}")
+        part_source_3d_contract = _json_property(
+            part,
+            SOURCE_3D_CONTRACT_KEY,
+            f"source 3D contract on {part.name}",
+        )
+        part_attachment = _validate_xml_attachment(
+            _json_property(
+                part,
+                XML_ATTACHMENT_KEY,
+                f"XML attachment on {part.name}",
+            ),
+            f"XML attachment on {part.name}",
+        )
+        try:
+            part_frame = Matrix(
+                json.loads(part["speedtree_cluster_frame_world"])
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Auto capture 3D frame is invalid: {part.name}") from exc
+        if (
+            part_source_3d_contract != source_3d_contract
+            or part_attachment != plan_attachment
+            or any(
+                abs(float(part_frame[row][column] - plan_frame[row][column]))
+                > _TOLERANCE
+                for row in range(4)
+                for column in range(4)
+            )
+        ):
+            raise ValueError(f"Auto capture plan/3D frame mismatch: {plan.name}")
+
+        projection_basis = _json_property(
+            plan,
+            PROJECTION_BASIS_KEY,
+            f"projection basis on {plan.name}",
+        )
+        stored_coverage = _json_property(
+            plan,
+            PROJECTION_COVERAGE_KEY,
+            f"projection coverage on {plan.name}",
+        )
+        if (
+            projection_basis.get("policy")
+            != "camera_aligned_canonical_local_xy"
+            or not _vectors_close(projection_basis.get("right"), (1.0, 0.0, 0.0))
+            or not _vectors_close(projection_basis.get("up"), (0.0, 1.0, 0.0))
+            or not _vectors_close(projection_basis.get("normal"), (0.0, 0.0, 1.0))
+            or any(abs(float(vertex.co.z)) > _TOLERANCE for vertex in plan.data.vertices)
+        ):
+            raise ValueError(f"Auto capture plan local plane is not canonical XY: {plan.name}")
+        boundary_indices = _ordered_boundary_indices(
+            [
+                tuple(int(value) for value in polygon.vertices)
+                for polygon in plan.data.polygons
+            ]
+        )
+        plan_boundary = [
+            (
+                float(plan.data.vertices[index].co.x),
+                float(plan.data.vertices[index].co.y),
+            )
+            for index in boundary_indices
+        ]
+        projected_part = [
+            (float(vertex.co.x), float(vertex.co.y))
+            for vertex in part.data.vertices
+        ]
+        actual_coverage = projection_coverage_2d(
+            projected_part,
+            plan_boundary,
+        )
+        if (
+            not actual_coverage["covers_projection"]
+            or stored_coverage != actual_coverage
+        ):
+            raise ValueError(f"Auto capture plan coverage is stale: {plan.name}")
+        rows.append(
+            {
+                "plan": plan.name,
+                "prototype_asset": counterpart_name,
+                "prototype_index": int(mapping.get("prototype_index", -1)),
+                "xml_bone_id": root_id,
+                "uv_minimum": actual_minimum,
+                "uv_maximum": actual_maximum,
+                "projection_coverage": actual_coverage,
+            }
+        )
+
+    if seen_xml_root_ids != set(source_3d_root_ids):
+        raise ValueError("Auto capture plans do not map every XML root exactly once.")
+    export_names = _validate_export(
+        scene,
+        plans,
+        [],
+        expected_export_names=expected_export_names,
+    )
+    target_spm = None
+    if expected_tree_spm is not None:
+        target_spm = Path(expected_tree_spm).expanduser().absolute()
+        if not target_spm.is_file():
+            raise ValueError("Explicit target SPM does not exist.")
+    return {
+        "delivery_mode": "blender_world_axis_auto_capture",
+        "contract_sha256": contract_hash,
+        "capture_manifest": str(manifest_path),
+        "capture_manifest_sha256": contract["capture_manifest_sha256"],
+        "capture_plane": frame["plane"],
+        "capture_rotation_degrees": frame["rotation_degrees"],
+        "capture_axes": {
+            "right": list(frame["right"]),
+            "up": list(frame["up"]),
+            "normal": list(frame["normal"]),
+            "view_direction": list(frame["view"]),
+        },
+        "orthogonality_error": frame["orthogonality_error"],
+        "handedness": frame["handedness"],
+        "rig": rig,
+        "material": material_name,
+        "color": str(color_path),
+        "opacity": str(opacity_path),
+        "map_fingerprints": {
+            role: {
+                "path": str(row["path"]),
+                "sha256": row["sha256"],
+                "size": row["size"],
+            }
+            for role, row in map_rows.items()
+        },
+        "plan_collection": plan_collection_name,
+        "card_count": card_count,
+        "prototype_count": prototype_count,
+        "source_partition_mode": prototype_map.get("source_partition_mode"),
+        "card_prototype_map_sha256": prototype_map_hash,
+        "source_3d_contract_sha256": source_3d_contract_hash,
+        "target_spm": str(target_spm) if target_spm is not None else None,
+        "export_objects": export_names,
+        "planes": rows,
+    }
+
+
+def validate_physical_direct_capture_delivery(
+    scene,
+    plan_collection_name,
+    material_name,
+    *,
+    plan_base=None,
+    expected_export_names=None,
+    expected_tree_spm=None,
+    expected_card_count=None,
+    expected_prototype_count=None,
+):
+    """Validate maps, plans, prototypes, and attachments against one final SHA."""
+    contract = _json_property(
+        scene,
+        PHYSICAL_CAPTURE_CONTRACT_KEY,
+        "Scene physical capture contract",
+    )
+    contract, frame, contract_hash = _validate_physical_capture_contract(contract)
+    if str(scene.get(PHYSICAL_CAPTURE_CONTRACT_HASH_KEY) or "") != contract_hash:
+        raise ValueError("Scene physical capture contract hash is stale.")
+    for legacy_key in (
+        CAMERA_CONTRACT_KEY,
+        CAMERA_CONTRACT_HASH_KEY,
+        CAMERA_BUNDLE_KEY,
+    ):
+        if scene.get(legacy_key):
+            raise ValueError(
+                "Physical direct capture contains an active legacy camera contract."
+            )
+    if bpy.data.collections.get(CAMERA_REFERENCE_COLLECTION) is not None:
+        raise ValueError(
+            "Physical direct capture contains a legacy camera reference collection."
+        )
+
+    manifest_path = Path(
+        str(contract.get("capture_manifest") or "")
+    ).expanduser().absolute()
+    if not manifest_path.is_file():
+        raise ValueError("Physical direct capture manifest is missing.")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Physical direct capture manifest is invalid: {exc}") from exc
+    if (
+        manifest.get("normalization_status") != "finalized"
+        or manifest.get("physical_capture_contract_sha256") != contract_hash
+        or manifest.get("physical_capture_contract") != contract
+        or manifest.get("frame") != frame
+    ):
+        raise ValueError(
+            "Physical capture maps and normalized plans do not share one final contract."
+        )
+    contract_maps = {
+        str(row.get("role") or ""): row
+        for row in contract.get("capture_maps") or []
+    }
+    manifest_maps = {
+        str(row.get("role") or ""): row
+        for row in manifest.get("maps") or []
+    }
+    if set(contract_maps) != set(AUTO_CAPTURE_MAP_ROLES) or set(
+        manifest_maps
+    ) != set(AUTO_CAPTURE_MAP_ROLES):
+        raise ValueError("Physical direct capture does not contain all eight maps.")
+    for role in AUTO_CAPTURE_MAP_ROLES:
+        contract_row = contract_maps[role]
+        manifest_row = manifest_maps[role]
+        map_path = Path(str(contract_row.get("path") or "")).expanduser().absolute()
+        if (
+            not map_path.is_file()
+            or int(contract_row.get("size", -1)) != map_path.stat().st_size
+            or str(contract_row.get("sha256") or "") != _sha256(map_path)
+            or str(manifest_row.get("path") or "")
+            != str(contract_row.get("path") or "")
+            or int(manifest_row.get("size", -1))
+            != int(contract_row.get("size", -2))
+            or str(manifest_row.get("sha256") or "")
+            != str(contract_row.get("sha256") or "")
+            or manifest_row.get("physical_capture_contract_sha256")
+            != contract_hash
+        ):
+            raise ValueError(f"Physical direct capture map lineage is stale: {role}")
+
+    (
+        source_3d_contract,
+        source_3d_contract_hash,
+        source_3d_root_ids,
+        authoritative_source_3d_roots,
+    ) = _validate_source_3d_contract(scene)
+    plan_collection = bpy.data.collections.get(plan_collection_name)
+    if plan_collection is None or plan_collection.children:
+        raise ValueError("Physical direct capture plan collection is missing or nested.")
+    plans = sorted(
+        (
+            obj
+            for obj in plan_collection.objects
+            if obj.type == "MESH"
+            and obj.get(ASSET_ROLE_KEY) == "speedtree_plan"
+        ),
+        key=lambda obj: obj.name.casefold(),
+    )
+    if len(plans) != len(plan_collection.objects) or not plans:
+        raise ValueError(
+            "Physical direct capture plan collection contains unexpected objects."
+        )
+    if expected_card_count is not None and len(plans) != int(expected_card_count):
+        raise ValueError("Physical direct capture plan count is unexpected.")
+    if plan_base:
+        expected_names = [
+            f"{plan_base}_{index:02d}"
+            for index in range(1, len(plans) + 1)
+        ]
+        if [plan.name for plan in plans] != expected_names:
+            raise ValueError("Physical direct capture plan names are not ordinal.")
+
+    prototype_map = _json_property(
+        scene,
+        CARD_PROTOTYPE_MAP_KEY,
+        "card/prototype mapping contract",
+    )
+    prototype_map_hash = str(scene.get(CARD_PROTOTYPE_MAP_HASH_KEY) or "")
+    mapping_rows = prototype_map.get("cards") or []
+    mapping_by_plan = {
+        str(row.get("plan") or ""): row for row in mapping_rows
+    }
+    prototype_assets = {
+        str(row.get("prototype_asset") or "") for row in mapping_rows
+    }
+    if (
+        not prototype_map_hash
+        or _canonical_sha256(prototype_map) != prototype_map_hash
+        or int(prototype_map.get("card_count", -1)) != len(plans)
+        or str(prototype_map.get("source_3d_contract_sha256") or "")
+        != source_3d_contract_hash
+        or set(mapping_by_plan) != {plan.name for plan in plans}
+        or any(
+            row.get("uv_source") != DIRECT_CAPTURE_UV_SOURCE
+            for row in mapping_rows
+        )
+        or "" in prototype_assets
+        or (
+            expected_prototype_count is not None
+            and len(prototype_assets) != int(expected_prototype_count)
+        )
+    ):
+        raise ValueError("Physical direct card/prototype mapping is stale.")
+
+    material = bpy.data.materials.get(material_name)
+    if material is None:
+        raise ValueError(f"Physical direct material is missing: {material_name}")
+    capture_center = Vector(frame["center"])
+    capture_right = Vector(frame["right"])
+    capture_up = Vector(frame["up"])
+    capture_normal = Vector(frame["normal"])
+    fit_scale = float(frame["fit_scale"])
+    attachment_by_asset = {
+        str(row.get("prototype_asset") or ""): row
+        for row in contract.get("attachment_pivots") or []
+    }
+    rows = []
+    seen_roots = set()
+    for plan in plans:
+        mapping = mapping_by_plan[plan.name]
+        counterpart = str(plan.get(COUNTERPART_KEY) or "")
+        part = bpy.data.objects.get(counterpart + "_Mesh")
+        if (
+            not _identity_object(plan)
+            or part is None
+            or part.type != "MESH"
+            or any(
+                abs(
+                    float(
+                        matrix[row][column]
+                        - Matrix.Identity(4)[row][column]
+                    )
+                )
+                > _TOLERANCE
+                for matrix in (part.matrix_world, part.matrix_basis)
+                for row in range(4)
+                for column in range(4)
+            )
+            or plan.get(PHYSICAL_CAPTURE_CONTRACT_HASH_KEY) != contract_hash
+            or plan.data.get(PHYSICAL_CAPTURE_CONTRACT_HASH_KEY) != contract_hash
+            or part.get(PHYSICAL_CAPTURE_CONTRACT_HASH_KEY) != contract_hash
+            or plan.get(CAMERA_CONTRACT_HASH_KEY)
+            or plan.get(CAMERA_REFERENCE_KEY)
+            or plan.get(UV_TRANSFER_KEY)
+            or plan.get("speedtree_cluster_uv_policy")
+            != "direct_physical_capture_projection"
+            or [slot for slot in plan.data.materials] != [material]
+        ):
+            raise ValueError(f"Physical direct plan/prototype is stale: {plan.name}")
+        transfer = _json_property(
+            plan,
+            DIRECT_CAPTURE_UV_KEY,
+            f"direct capture UV contract on {plan.name}",
+        )
+        plan_attachment = _validate_xml_attachment(
+            _json_property(
+                plan,
+                XML_ATTACHMENT_KEY,
+                f"XML attachment on {plan.name}",
+            ),
+            f"XML attachment on {plan.name}",
+        )
+        root_id = int(plan_attachment["xml_bone_id"])
+        authoritative = next(
+            (
+                row
+                for row in authoritative_source_3d_roots
+                if int(row["xml_bone_id"]) == root_id
+            ),
+            None,
+        )
+        if (
+            transfer.get("policy") != "direct_physical_capture_projection"
+            or transfer.get("direct_uv_source") != DIRECT_CAPTURE_UV_SOURCE
+            or transfer.get("capture_contract_sha256") != contract_hash
+            or mapping.get("uv_source") != DIRECT_CAPTURE_UV_SOURCE
+            or int(mapping.get("xml_bone_id", -1)) != root_id
+            or mapping.get("prototype_asset") != counterpart
+            or authoritative is None
+            or not _attachment_matches_contract(plan_attachment, authoritative)
+            or root_id in seen_roots
+        ):
+            raise ValueError(f"Physical direct attachment lineage is stale: {plan.name}")
+        seen_roots.add(root_id)
+
+        try:
+            plan_frame = Matrix(json.loads(plan["speedtree_cluster_frame_world"]))
+            part_frame = Matrix(json.loads(part["speedtree_cluster_frame_world"]))
+            plan_source_frame = Matrix(
+                json.loads(plan["speedtree_cluster_source_frame_world"])
+            )
+            part_source_frame = Matrix(
+                json.loads(part["speedtree_cluster_source_frame_world"])
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Physical direct frame is invalid: {plan.name}") from exc
+        projection_basis = _json_property(
+            plan,
+            PROJECTION_BASIS_KEY,
+            f"projection basis on {plan.name}",
+        )
+        try:
+            local_right = Vector(projection_basis["right"]).normalized()
+            local_up = Vector(projection_basis["up"]).normalized()
+            local_normal = Vector(projection_basis["normal"]).normalized()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Physical direct projection basis is invalid: {plan.name}"
+            ) from exc
+        attachment = attachment_by_asset.get(counterpart)
+        if attachment is None:
+            raise ValueError(f"Physical capture attachment is missing: {counterpart}")
+        source_world = Vector(attachment["source_world"])
+        fitted_world = Vector(attachment["fitted_capture_world"])
+        expected_fitted = capture_center + (
+            source_world - capture_center
+        ) * fit_scale
+        plan_rotation = plan_frame.to_3x3()
+        world_right = (plan_rotation @ local_right).normalized()
+        world_up = (plan_rotation @ local_up).normalized()
+        world_normal = (plan_rotation @ local_normal).normalized()
+        raw_xml_direction_world = (
+            attachment_endpoint_world(plan_attachment)
+            - attachment_origin_world(plan_attachment)
+        )
+        raw_projected_xml_direction_world = (
+            raw_xml_direction_world
+            - capture_normal
+            * raw_xml_direction_world.dot(capture_normal)
+        )
+        tangent = transfer.get("attachment_tangent_projection") or {}
+        direction_policy = str(tangent.get("direction_policy") or "")
+        projection_tolerance = float(
+            tangent.get("projection_tolerance") or 1.0e-9
+        )
+        expected_projection_tolerance = (
+            physical_capture_projection_tolerance(
+                raw_xml_direction_world,
+                plan_attachment,
+            )
+        )
+        recorded_projection = Vector(
+            tangent.get("capture_plane_world") or (math.nan,) * 3
+        )
+        aligned_xml_direction_world = Vector(
+            tangent.get("aligned_capture_plane_world") or (math.nan,) * 3
+        )
+        if (
+            not all(math.isfinite(float(value)) for value in recorded_projection)
+            or not all(
+                math.isfinite(float(value))
+                for value in aligned_xml_direction_world
+            )
+            or projection_tolerance <= 0.0
+            or abs(
+                projection_tolerance - expected_projection_tolerance
+            )
+            > max(expected_projection_tolerance * 1.0e-9, 1.0e-12)
+            or (
+                recorded_projection - raw_projected_xml_direction_world
+            ).length
+            > _TOLERANCE
+            or aligned_xml_direction_world.length <= projection_tolerance
+        ):
+            raise ValueError(
+                f"Physical capture attachment direction evidence is invalid: {plan.name}"
+            )
+        if direction_policy == PHYSICAL_CAPTURE_DIRECTION_PROJECTED_XML:
+            if (
+                raw_projected_xml_direction_world.length <= projection_tolerance
+                or (
+                    aligned_xml_direction_world
+                    - raw_projected_xml_direction_world
+                ).length
+                > _TOLERANCE
+            ):
+                raise ValueError(
+                    f"Projected XML attachment direction is stale: {plan.name}"
+                )
+        elif (
+            direction_policy
+            == PHYSICAL_CAPTURE_DIRECTION_CAPTURE_UP_FALLBACK
+        ):
+            if (
+                raw_projected_xml_direction_world.length > projection_tolerance
+                or (
+                    aligned_xml_direction_world.normalized()
+                    - capture_up
+                ).length
+                > _TOLERANCE
+            ):
+                raise ValueError(
+                    f"Capture-normal attachment fallback is stale: {plan.name}"
+                )
+        else:
+            raise ValueError(
+                f"Physical capture attachment direction policy is invalid: {plan.name}"
+            )
+        aligned_xml_direction_world.normalize()
+        xml_direction_local = (
+            plan_rotation.inverted_safe() @ aligned_xml_direction_world
+        ).normalized()
+        frame_axis_y_world = (
+            plan_rotation @ Vector((0.0, 1.0, 0.0))
+        ).normalized()
+        frame_axis_z_world = (
+            plan_rotation @ Vector((0.0, 0.0, 1.0))
+        ).normalized()
+        if (
+            plan.get("speedtree_cluster_frame_policy")
+            != PHYSICAL_CAPTURE_ALIGNED_FRAME_POLICY
+            or (world_right - capture_right).length > _TOLERANCE
+            or (world_up - capture_up).length > _TOLERANCE
+            or (world_normal - capture_normal).length > _TOLERANCE
+            or (xml_direction_local - Vector((0.0, 1.0, 0.0))).length
+            > _TOLERANCE
+            or (
+                frame_axis_y_world - aligned_xml_direction_world
+            ).length
+            > _TOLERANCE
+            or (frame_axis_z_world - capture_normal).length > _TOLERANCE
+            or (plan_frame.translation - fitted_world).length > _TOLERANCE
+            or (expected_fitted - fitted_world).length > _TOLERANCE
+            or any(
+                abs(float(plan_frame[row][column] - part_frame[row][column]))
+                > _TOLERANCE
+                for row in range(4)
+                for column in range(4)
+            )
+            or any(
+                abs(
+                    float(
+                        part_source_frame[row][column]
+                        - plan_source_frame[row][column]
+                    )
+                )
+                > _TOLERANCE
+                for row in range(4)
+                for column in range(4)
+            )
+        ):
+            raise ValueError(f"Physical direct pair frame drifted: {plan.name}")
+        attachment_index = int(transfer.get("attachment_vertex_index", -1))
+        if (
+            attachment_index < 0
+            or attachment_index >= len(plan.data.vertices)
+            or plan.data.vertices[attachment_index].co.length > _TOLERANCE
+        ):
+            raise ValueError(f"Physical direct pivot is not local zero: {plan.name}")
+
+        expected_uvs = []
+        for vertex in plan.data.vertices:
+            world = plan_frame @ vertex.co
+            relative = world - capture_center
+            expected_uvs.append(
+                [
+                    0.5 + float(relative.dot(capture_right)) / float(frame["width"]),
+                    0.5 + float(relative.dot(capture_up)) / float(frame["height"]),
+                ]
+            )
+        actual_uvs = _vertex_uvs(
+            plan.data,
+            expected_uvs=transfer.get("result_uvs"),
+            label=plan.name,
+        )
+        if max(
+            abs(actual_uvs[index][axis] - expected_uvs[index][axis])
+            for index in range(len(actual_uvs))
+            for axis in range(2)
+        ) > 5.0e-6:
+            raise ValueError(
+                f"Physical direct UV differs from its capture projection: {plan.name}"
+            )
+        if min(value for uv in actual_uvs for value in uv) < -_UV_TOLERANCE or max(
+            value for uv in actual_uvs for value in uv
+        ) > 1.0 + _UV_TOLERANCE:
+            raise ValueError(f"Physical direct UV escaped its frame: {plan.name}")
+        boundary = _ordered_boundary_indices(
+            [
+                tuple(int(value) for value in polygon.vertices)
+                for polygon in plan.data.polygons
+            ]
+        )
+        if max(
+            abs(float(vertex.co.dot(local_normal)))
+            for vertex in plan.data.vertices
+        ) > _TOLERANCE:
+            raise ValueError(
+                f"Physical direct plan left its captured projection plane: {plan.name}"
+            )
+        coverage = projection_coverage_2d(
+            [
+                (
+                    float(vertex.co.dot(local_right)),
+                    float(vertex.co.dot(local_up)),
+                )
+                for vertex in part.data.vertices
+            ],
+            [
+                (
+                    float(plan.data.vertices[index].co.dot(local_right)),
+                    float(plan.data.vertices[index].co.dot(local_up)),
+                )
+                for index in boundary
+            ],
+        )
+        stored_coverage = _json_property(
+            plan,
+            PROJECTION_COVERAGE_KEY,
+            f"projection coverage on {plan.name}",
+        )
+        coverage_integer_keys = (
+            "projected_point_count",
+            "outside_point_count",
+            "outside_point_indices",
+            "boundary_vertex_count",
+        )
+        if (
+            not coverage["covers_projection"]
+            or stored_coverage.get("covers_projection") is not True
+            or any(
+                coverage.get(key) != stored_coverage.get(key)
+                for key in coverage_integer_keys
+            )
+            or abs(
+                float(coverage["cross_product_tolerance"])
+                - float(stored_coverage.get("cross_product_tolerance", math.nan))
+            )
+            > max(
+                float(coverage["cross_product_tolerance"]),
+                float(stored_coverage.get("cross_product_tolerance", 0.0)),
+                1.0e-12,
+            )
+            * 1.0e-5
+        ):
+            raise ValueError(f"Physical direct plan coverage is stale: {plan.name}")
+        rows.append(
+            {
+                "plan": plan.name,
+                "prototype_asset": counterpart,
+                "xml_bone_id": root_id,
+                "uv_minimum": [
+                    min(uv[axis] for uv in actual_uvs) for axis in range(2)
+                ],
+                "uv_maximum": [
+                    max(uv[axis] for uv in actual_uvs) for axis in range(2)
+                ],
+                "fitted_attachment_world": list(fitted_world),
+            }
+        )
+    if seen_roots != set(source_3d_root_ids):
+        raise ValueError("Physical direct plans do not map every XML root exactly once.")
+    export_names = _validate_export(
+        scene,
+        plans,
+        [],
+        expected_export_names=expected_export_names,
+    )
+    target_spm = None
+    if expected_tree_spm is not None:
+        target_spm = Path(expected_tree_spm).expanduser().absolute()
+        if not target_spm.is_file():
+            raise ValueError("Explicit target SPM does not exist.")
+    return {
+        "delivery_mode": "physical_direct_capture",
+        "physical_capture_contract_sha256": contract_hash,
+        "capture_manifest": str(manifest_path),
+        "capture_manifest_sha256": _sha256(manifest_path),
+        "capture_plane": frame["plane"],
+        "capture_rotation_degrees": frame["rotation_degrees"],
+        "physical_target_meters": list(frame["target_meters"]),
+        "physical_fit_scale": fit_scale,
+        "direct_uv_source": DIRECT_CAPTURE_UV_SOURCE,
+        "card_count": len(plans),
+        "prototype_count": len(prototype_assets),
+        "card_prototype_map_sha256": prototype_map_hash,
+        "source_3d_contract_sha256": source_3d_contract_hash,
+        "target_spm": str(target_spm) if target_spm is not None else None,
+        "export_objects": export_names,
+        "planes": rows,
+    }
+
+
+def validate_cluster_delivery(
+    scene,
+    plan_collection_name,
+    material_name,
+    **kwargs,
+):
+    """Dispatch to the active persisted delivery contract without repairing data."""
+    if scene.get(PHYSICAL_CAPTURE_CONTRACT_KEY):
+        physical_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key
+            in {
+                "plan_base",
+                "expected_export_names",
+                "expected_tree_spm",
+                "expected_card_count",
+                "expected_prototype_count",
+            }
+        }
+        return validate_physical_direct_capture_delivery(
+            scene,
+            plan_collection_name,
+            material_name,
+            **physical_kwargs,
+        )
+    if scene.get(AUTO_CAPTURE_CONTRACT_KEY):
+        auto_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key
+            in {
+                "plan_base",
+                "expected_export_names",
+                "expected_tree_spm",
+                "expected_albedo_path",
+                "expected_card_count",
+                "expected_prototype_count",
+            }
+        }
+        return validate_auto_capture_delivery(
+            scene,
+            plan_collection_name,
+            material_name,
+            **auto_kwargs,
+        )
+    return validate_camera_uv_delivery(
+        scene,
+        plan_collection_name,
+        material_name,
+        **kwargs,
+    )
+
+
 def validate_camera_uv_delivery(
     scene,
     plan_collection_name,
@@ -732,6 +2219,27 @@ def validate_camera_uv_delivery(
         contract.get("camera", {}).get("name") != expected_camera_name
     ):
         raise ValueError("Explicit camera name differs from the persisted camera contract.")
+
+    if contract.get("kind") == "speedtree_cluster_card_uv_template":
+        receipt_row = contract.get("camera_capture_receipt") or {}
+        receipt_path = Path(str(receipt_row.get("path") or ""))
+        receipt_sha256 = str(receipt_row.get("sha256") or "")
+        if (
+            not receipt_path.is_file()
+            or not receipt_sha256
+            or bundle.get("camera_capture_receipt_path") != str(receipt_path.resolve())
+            or bundle.get("camera_capture_receipt_sha256") != receipt_sha256
+        ):
+            raise ValueError("Camera delivery capture receipt is missing or stale.")
+        from atlas_leaf_mesh_builder.integration_api import (
+            validate_external_camera_capture_receipt,
+        )
+
+        validate_external_camera_capture_receipt(
+            receipt_path,
+            contract,
+            camera_spm,
+        )
 
     for path_key, hash_key, label in (
         ("albedo_path", "albedo_sha256", "Color map"),
@@ -1088,7 +2596,7 @@ def validate_camera_uv_delivery(
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"3D part frame is invalid: {part.name}") from exc
             if (
-                part_frame.translation - Vector(part_attachment["xml_start_world"])
+                part_frame.translation - attachment_origin_world(part_attachment)
             ).length > _TOLERANCE:
                 raise ValueError(f"3D part frame does not start at XML root: {part.name}")
             coverage_points = [vertex.co.copy() for vertex in part.data.vertices]
@@ -1185,8 +2693,9 @@ def validate_camera_uv_delivery(
                 "source camera up",
             )
         )
-        xml_direction = Vector(plan_attachment["xml_end_world"]) - Vector(
-            plan_attachment["xml_start_world"]
+        xml_direction = (
+            attachment_endpoint_world(plan_attachment)
+            - attachment_origin_world(plan_attachment)
         )
         expected_root_axis = Vector(
             (xml_direction.dot(source_camera_right), xml_direction.dot(source_camera_up))
@@ -1221,11 +2730,9 @@ def validate_camera_uv_delivery(
         maximum_trim = float(
             plan_root_lock.get("maximum_root_margin_trim", math.nan)
         )
-        if (
-            plan_root_lock.get("policy")
-            != "xml_root_tangent_preserve_unexpanded_projection_support"
-            or plan_root_lock.get("attachment_inside_unexpanded_projection") is not True
-            or not all(
+        root_policy = str(plan_root_lock.get("policy") or "")
+        common_root_lock_invalid = (
+            not all(
                 math.isfinite(value)
                 for value in (
                     part_root_support,
@@ -1242,8 +2749,55 @@ def validate_camera_uv_delivery(
             or plan_root_lock.get("attachment_xy") != [0.0, 0.0]
             or abs(part_root_support - stored_unexpanded_support) > root_tolerance
             or abs(plan_root_support - stored_locked_support) > root_tolerance
-            or abs(part_root_support - plan_root_support) > root_tolerance
-        ):
+        )
+        if root_policy == "xml_root_tangent_preserve_unexpanded_projection_support":
+            policy_root_lock_invalid = (
+                plan_root_lock.get("attachment_inside_unexpanded_projection")
+                is not True
+                or abs(part_root_support - plan_root_support) > root_tolerance
+            )
+        elif root_policy == "xml_root_forward_ray_bridge_to_projection_support":
+            bridge_entry = float(
+                plan_root_lock.get("attachment_forward_ray_entry", math.nan)
+            )
+            bridge_exit = float(
+                plan_root_lock.get("attachment_forward_ray_exit", math.nan)
+            )
+            bridge_ratio = float(
+                plan_root_lock.get("attachment_gap_ratio", math.nan)
+            )
+            maximum_bridge_ratio = float(
+                plan_root_lock.get(
+                    "maximum_attachment_gap_ratio",
+                    math.nan,
+                )
+            )
+            policy_root_lock_invalid = (
+                plan_root_lock.get("attachment_inside_unexpanded_projection")
+                is not False
+                or not all(
+                    math.isfinite(value)
+                    for value in (
+                        bridge_entry,
+                        bridge_exit,
+                        bridge_ratio,
+                        maximum_bridge_ratio,
+                    )
+                )
+                or bridge_entry <= root_tolerance
+                or bridge_exit <= bridge_entry
+                or bridge_ratio < 0.0
+                or bridge_ratio > ROOT_BRIDGE_MAX_GAP_RATIO + _TOLERANCE
+                or abs(
+                    maximum_bridge_ratio - ROOT_BRIDGE_MAX_GAP_RATIO
+                )
+                > _TOLERANCE
+                or abs(plan_root_support) > root_tolerance
+                or part_root_support < plan_root_support - root_tolerance
+            )
+        else:
+            policy_root_lock_invalid = True
+        if common_root_lock_invalid or policy_root_lock_invalid:
             raise ValueError(f"Plan XML root support lock is stale: {plan.name}")
         rows.append(
             {

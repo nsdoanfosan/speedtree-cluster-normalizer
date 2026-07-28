@@ -200,10 +200,18 @@ def main():
         target_spm=str(target_spm),
         source_material_id=SOURCE_MATERIAL_ID,
         adopt_source_material=True,
-        mesh_geometry_scale=1.0,
+        mesh_geometry_scale=0.01,
+        mesh_asset_scale=1.0,
+        generator_variant_policy="ensure_all_material_cutouts",
         only_target=True,
     )
-    if configured.get("target_count") != 1 or configured.get("mesh_geometry_scale") != 1.0:
+    if (
+        configured.get("target_count") != 1
+        or configured.get("mesh_geometry_scale") != 0.01
+        or configured.get("mesh_asset_scale") != 1.0
+        or configured.get("generator_variant_policy")
+        != "ensure_all_material_cutouts"
+    ):
         raise RuntimeError(f"Atlas public configuration contract mismatch: {configured}")
     print(
         "ATLAS_CLUSTER_SPM_CONFIG="

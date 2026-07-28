@@ -12,6 +12,9 @@ from mathutils import Matrix, Vector
 from mathutils.geometry import delaunay_2d_cdt
 
 from .attachment_contract import (
+    attachment_endpoint_world,
+    attachment_origin_world,
+    fit_attachment_to_geometry,
     load_attachment_contract,
     match_root_attachment,
     serialized_attachment,
@@ -56,6 +59,50 @@ UV_TRANSFER_CANDIDATE_SELECTION_POLICY = (
     "exact_attachment_constrained_then_outline_normalized_rms"
 )
 CAMERA_ALIGNED_FRAME_POLICY = "shared_camera_right_up_normal_rigid_frame"
+PHYSICAL_CAPTURE_FRAME_POLICY = "physical_target_uniform_whole_source_fit"
+PHYSICAL_CAPTURE_ALIGNED_FRAME_POLICY = (
+    "physical_capture_projected_attachment_axis_xy_uniform_fit"
+)
+PHYSICAL_CAPTURE_DIRECTION_PROJECTED_XML = (
+    "project_xml_attachment_into_capture_plane"
+)
+PHYSICAL_CAPTURE_DIRECTION_CAPTURE_UP_FALLBACK = (
+    "capture_up_for_capture_normal_attachment"
+)
+WORKFLOW_LEGACY_CAMERA_UV = "LEGACY_CAMERA_UV"
+WORKFLOW_PHYSICAL_DIRECT_CAPTURE = "PHYSICAL_DIRECT_CAPTURE"
+DIRECT_CAPTURE_UV_SOURCE = "same_blender_physical_capture_projection"
+PHYSICAL_CAPTURE_CONTRACT_KEY = "speedtree_cluster_physical_capture_contract"
+PHYSICAL_CAPTURE_CONTRACT_HASH_KEY = (
+    "speedtree_cluster_physical_capture_contract_sha256"
+)
+DIRECT_CAPTURE_UV_KEY = "speedtree_cluster_direct_capture_uv"
+ROOT_BRIDGE_MAX_GAP_RATIO = 0.25
+
+
+def physical_capture_projection_tolerance(raw_direction, attachment=None):
+    """Return the shared scale-aware capture-plane direction tolerance."""
+    direction = Vector(raw_direction)
+    if not all(math.isfinite(float(value)) for value in direction):
+        raise ValueError("Physical capture attachment direction is not finite.")
+    attachment = attachment if isinstance(attachment, dict) else {}
+    evidence = [
+        float(direction.length) * 1.0e-8,
+        1.0e-9,
+    ]
+    for key in (
+        "match_tolerance",
+        "effective_support_tolerance_world",
+    ):
+        value = float(attachment.get(key) or 0.0)
+        if math.isfinite(value) and value > 0.0:
+            evidence.append(value)
+    geometry_scale = float(
+        attachment.get("effective_geometry_scale_world") or 0.0
+    )
+    if math.isfinite(geometry_scale) and geometry_scale > 0.0:
+        evidence.append(geometry_scale * 1.0e-8)
+    return max(evidence)
 
 
 def _natural_key(value):
@@ -272,11 +319,12 @@ def _preferred_endpoint_bone(bone, populated_bones):
         for child in bone.children:
             if child.name.casefold() == expected.casefold():
                 return child, "matching_end_child"
+        return None, "start_bone_tail_axis_endpoint"
     if bone.name.casefold().endswith("_end") and bone.parent is None:
         return None, "orphan_end_uses_validated_asset_root_pivot"
     raise ValueError(
-        f"Populated deform bone '{bone.name}' must have a direct matching *_End child, "
-        "or be an orphan root *_End handled by a validated asset pivot."
+        f"Populated deform bone '{bone.name}' must be a *_Start axis bone or an "
+        "orphan root *_End handled by a validated asset pivot."
     )
 
 
@@ -326,8 +374,8 @@ def canonical_frame(
             else armature_world @ bone.tail_local
         )
     else:
-        origin = Vector(attachment["xml_start_world"])
-        endpoint = Vector(attachment["xml_end_world"])
+        origin = attachment_origin_world(attachment)
+        endpoint = attachment_endpoint_world(attachment)
     world_points = [
         source.matrix_world @ source.data.vertices[index].co
         for index in vertex_indices
@@ -545,6 +593,234 @@ def camera_aligned_frame(source, source_frame, vertex_indices, camera):
     return result
 
 
+def _physical_capture_camera(frame):
+    return {
+        "right": list(frame["right"]),
+        "up": list(frame["up"]),
+        "plane_normal": list(frame["normal"]),
+        "view_direction": list(frame["view_direction"]),
+    }
+
+
+def _validate_physical_capture_contract(contract):
+    if not isinstance(contract, dict):
+        raise ValueError("Physical direct capture requires an explicit capture contract.")
+    if (
+        contract.get("kind") != "speedtree_cluster_physical_capture_fit"
+        or int(contract.get("version", 0)) != 1
+        or contract.get("workflow_mode") != WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+        or contract.get("direct_uv_source") != DIRECT_CAPTURE_UV_SOURCE
+    ):
+        raise ValueError("Physical capture contract kind/workflow is unsupported.")
+    recorded_hash = str(contract.get("contract_sha256") or "")
+    hash_payload = {
+        key: value for key, value in contract.items() if key != "contract_sha256"
+    }
+    if not recorded_hash or recorded_hash != _canonical_sha256(hash_payload):
+        raise ValueError("Physical capture contract hash is missing or stale.")
+    frame = contract.get("frame") or {}
+    if (
+        frame.get("policy") != PHYSICAL_CAPTURE_FRAME_POLICY
+        or frame.get("workflow_mode") != WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+        or frame.get("direct_uv_source") != DIRECT_CAPTURE_UV_SOURCE
+    ):
+        raise ValueError("Physical capture frame is not the direct-capture policy.")
+    if str(frame.get("unit_system") or "") != "METRIC":
+        raise ValueError("Physical capture frame is not in a METRIC scene.")
+    scale_length = float(frame.get("scale_length", math.nan))
+    fit_scale = float(frame.get("fit_scale", math.nan))
+    width = float(frame.get("width", math.nan))
+    height = float(frame.get("height", math.nan))
+    target_meters = frame.get("target_meters") or []
+    target_units = frame.get("target_blender_units") or []
+    if (
+        not all(math.isfinite(value) and value > 0.0 for value in (
+            scale_length,
+            fit_scale,
+            width,
+            height,
+        ))
+        or len(target_meters) != 2
+        or len(target_units) != 2
+        or abs(width - height) > 1.0e-9
+        or max(abs(float(value) - width) for value in target_units) > 1.0e-9
+        or max(
+            abs(float(target_meters[index]) / scale_length - float(target_units[index]))
+            for index in range(2)
+        )
+        > 1.0e-9
+    ):
+        raise ValueError("Physical capture unit/target evidence is invalid.")
+    _camera_world_axes(_physical_capture_camera(frame))
+    return contract, frame, recorded_hash
+
+
+def physical_capture_aligned_frame(
+    source,
+    source_frame,
+    vertex_indices,
+    capture_frame,
+):
+    """Fit a pair while preserving its captured attachment direction in local XY."""
+    indices = sorted({int(index) for index in vertex_indices})
+    if len(indices) < 3:
+        raise ValueError("Physical capture frame requires at least three source vertices.")
+    source_matrix = source_frame["matrix_world"].copy()
+    source_axes = [
+        Vector(source_matrix.to_3x3().col[index]).normalized()
+        for index in range(3)
+    ]
+    if source_axes[0].cross(source_axes[1]).dot(source_axes[2]) < 0.999999:
+        raise ValueError(
+            "Physical capture source frame is not a right-handed authored axis frame."
+        )
+    _capture_right, capture_up, capture_normal = _camera_world_axes(
+        _physical_capture_camera(capture_frame)
+    )
+    raw_attachment = source_matrix.translation.copy()
+    raw_endpoint = Vector(source_frame["endpoint_world"])
+    raw_direction = raw_endpoint - raw_attachment
+    raw_length = float(raw_direction.length)
+    source_size = (
+        (source_frame.get("source_world_bounds") or {}).get("size") or []
+    )
+    finite_source_size = [
+        abs(float(value))
+        for value in source_size
+        if math.isfinite(float(value))
+    ]
+    geometry_scale = max(finite_source_size, default=raw_length)
+    numeric_direction_tolerance = max(
+        geometry_scale * 1.0e-12,
+        1.0e-12,
+    )
+    if (
+        not math.isfinite(raw_length)
+        or raw_length <= numeric_direction_tolerance
+    ):
+        raise ValueError(
+            "Physical capture XML attachment has no finite 3D direction."
+        )
+    projected_direction = (
+        raw_direction - capture_normal * raw_direction.dot(capture_normal)
+    )
+    direction_tolerance = physical_capture_projection_tolerance(
+        raw_direction,
+        source_frame.get("xml_attachment"),
+    )
+    if projected_direction.length <= direction_tolerance:
+        aligned_direction = capture_up * max(
+            raw_length,
+            float(source_frame.get("endpoint_length") or 0.0),
+            direction_tolerance,
+        )
+        direction_policy = PHYSICAL_CAPTURE_DIRECTION_CAPTURE_UP_FALLBACK
+    else:
+        aligned_direction = projected_direction.copy()
+        direction_policy = PHYSICAL_CAPTURE_DIRECTION_PROJECTED_XML
+    axis_y = aligned_direction.normalized()
+    axis_z = capture_normal.normalized()
+    axis_x = axis_y.cross(axis_z).normalized()
+    alignment_matrix = Matrix.Identity(4)
+    for row in range(3):
+        alignment_matrix[row][0] = axis_x[row]
+        alignment_matrix[row][1] = axis_y[row]
+        alignment_matrix[row][2] = axis_z[row]
+        alignment_matrix[row][3] = raw_attachment[row]
+    fit_scale = float(capture_frame["fit_scale"])
+    capture_center = Vector(capture_frame["center"])
+    fitted_attachment = (
+        capture_center + (raw_attachment - capture_center) * fit_scale
+    )
+    matrix_world = alignment_matrix.copy()
+    matrix_world.translation = fitted_attachment
+    source_to_normalized = (
+        Matrix.Diagonal((fit_scale, fit_scale, fit_scale, 1.0))
+        @ alignment_matrix.inverted_safe()
+        @ source.matrix_world
+    )
+    local_points = [
+        source_to_normalized @ source.data.vertices[index].co
+        for index in indices
+    ]
+    bounds = _bounds(local_points)
+    if bounds is None or max(bounds["size"]) <= 0.0:
+        raise ValueError("Physical capture source subset has no measurable geometry.")
+    projected_endpoint = raw_attachment + aligned_direction
+    fitted_endpoint = (
+        capture_center
+        + (projected_endpoint - capture_center) * fit_scale
+    )
+    endpoint_local = (
+        alignment_matrix.to_3x3().inverted_safe()
+        @ (aligned_direction * fit_scale)
+    )
+    endpoint_numeric_tolerance = max(
+        max(bounds["size"]) * 1.0e-12,
+        1.0e-12,
+    )
+    endpoint_axis = (
+        endpoint_local / endpoint_local.length
+        if endpoint_local.length > endpoint_numeric_tolerance
+        else Vector((math.nan, math.nan, math.nan))
+    )
+    if (
+        not all(math.isfinite(float(value)) for value in endpoint_local)
+        or endpoint_local.length <= endpoint_numeric_tolerance
+        or (endpoint_axis - Vector((0.0, 1.0, 0.0))).length > 1.0e-6
+    ):
+        raise ValueError(
+            "Physical capture source attachment axis is not the authored local +Y axis: "
+            f"endpoint_local={tuple(float(value) for value in endpoint_local)}, "
+            f"numeric_tolerance={endpoint_numeric_tolerance:.9g}."
+        )
+    endpoint_length = max(
+        float(endpoint_local.length),
+        max(bounds["size"]) * 0.05,
+    )
+    result = dict(source_frame)
+    result.update(
+        {
+            "matrix_world": matrix_world,
+            "origin_world": [float(value) for value in fitted_attachment],
+            "endpoint_world": [float(value) for value in fitted_endpoint],
+            "endpoint_length": float(endpoint_length),
+            "normalized_bounds": bounds,
+            "orientation_policy": PHYSICAL_CAPTURE_ALIGNED_FRAME_POLICY,
+            "source_frame_world": source_matrix.copy(),
+            "source_alignment_frame_world": alignment_matrix.copy(),
+            "source_endpoint_world": [
+                float(value) for value in raw_endpoint
+            ],
+            "source_to_normalized_matrix": source_to_normalized,
+            "physical_fit_scale": fit_scale,
+            "attachment_tangent_projection": {
+                "source_world": [float(value) for value in raw_direction],
+                "capture_plane_world": [
+                    float(value) for value in projected_direction
+                ],
+                "aligned_capture_plane_world": [
+                    float(value) for value in aligned_direction
+                ],
+                "direction_policy": direction_policy,
+                "projection_tolerance": float(direction_tolerance),
+                "discarded_capture_normal_component": float(
+                    raw_direction.dot(capture_normal)
+                ),
+                "normalized_local_xy": [0.0, 1.0],
+            },
+            "capture_attachment": {
+                "source_world": [float(value) for value in raw_attachment],
+                "fitted_capture_world": [
+                    float(value) for value in fitted_attachment
+                ],
+                "normalized_local": [0.0, 0.0, 0.0],
+            },
+        }
+    )
+    return result
+
+
 def camera_projection_basis_in_part(frame, camera):
     camera_right, camera_up, camera_normal = _camera_world_axes(camera)
     if frame.get("orientation_policy") == CAMERA_ALIGNED_FRAME_POLICY:
@@ -676,14 +952,74 @@ def root_locked_expanded_hull(points, margin_ratio, root_axis):
     ]
     diagonal = math.hypot(*spans)
     tolerance = max(diagonal * 1.0e-7, 1.0e-9)
-    if not point_in_convex_polygon(attachment, base_hull, tolerance=tolerance):
-        raise ValueError(
-            "XML attachment origin is outside the unexpanded 3D projection hull; "
-            "the XML/root mapping or camera contract is inconsistent."
-        )
-    root_support = min(Vector(point).dot(axis) for point in base_hull)
+    attachment_inside = point_in_convex_polygon(
+        attachment,
+        base_hull,
+        tolerance=tolerance,
+    )
+    ray_hits = []
+    if not attachment_inside:
+        ray_hits = []
+        for index, first in enumerate(base_hull):
+            second = base_hull[(index + 1) % len(base_hull)]
+            edge = Vector((second[0] - first[0], second[1] - first[1]))
+            denominator = axis.x * edge.y - axis.y * edge.x
+            if abs(float(denominator)) <= tolerance:
+                continue
+            point = Vector(first)
+            distance = (point.x * edge.y - point.y * edge.x) / denominator
+            fraction = (point.x * axis.y - point.y * axis.x) / denominator
+            if distance >= -tolerance and -tolerance <= fraction <= 1.0 + tolerance:
+                ray_hits.append(max(float(distance), 0.0))
+        ray_hits.sort()
+        unique_hits = []
+        for distance in ray_hits:
+            if not unique_hits or abs(distance - unique_hits[-1]) > tolerance:
+                unique_hits.append(distance)
+        ray_hits = unique_hits
+
+    coverage_root_support = min(
+        Vector(point).dot(axis)
+        for point in base_hull
+    )
+    bridge_entry = None
+    bridge_exit = None
+    bridge_gap_ratio = None
+    if attachment_inside:
+        support_hull = base_hull
+        root_support = coverage_root_support
+        policy = "xml_root_tangent_preserve_unexpanded_projection_support"
+    else:
+        if len(ray_hits) < 2:
+            raise ValueError(
+                "XML attachment origin is outside the unexpanded 3D projection "
+                "hull and its forward root axis does not enter the projection; "
+                "the XML/root mapping or camera contract is inconsistent."
+            )
+        bridge_entry = float(ray_hits[0])
+        bridge_exit = float(ray_hits[-1])
+        bridge_gap_ratio = bridge_entry / diagonal
+        if (
+            coverage_root_support < -tolerance
+            or bridge_gap_ratio > ROOT_BRIDGE_MAX_GAP_RATIO
+        ):
+            raise ValueError(
+                "XML attachment origin is outside the unexpanded 3D projection "
+                "hull and its forward root gap exceeds the validated bridge "
+                "contract; "
+                f"entry={bridge_entry:.9g}, diagonal={diagonal:.9g}, "
+                f"ratio={bridge_gap_ratio:.9g}, "
+                f"maximum={ROOT_BRIDGE_MAX_GAP_RATIO:.9g}."
+            )
+        # The XML axis is valid and enters the source silhouette shortly after
+        # the physical attachment.  Keep that authored attachment as the plan
+        # root, bridge only the verified forward gap, and never manufacture a
+        # root-side margin behind it.
+        support_hull = convex_hull_2d([*base_hull, attachment])
+        root_support = 0.0
+        policy = "xml_root_forward_ray_bridge_to_projection_support"
     distal_support = max(Vector(point).dot(axis) for point in base_hull)
-    expanded = expanded_hull(base_hull, margin_ratio)
+    expanded = expanded_hull(support_hull, margin_ratio)
     locked_points = []
     maximum_trim = 0.0
     for point in expanded:
@@ -696,7 +1032,7 @@ def root_locked_expanded_hull(points, margin_ratio, root_axis):
     # Clipping only the expanded vertices can move an adjacent support edge
     # across a sharp root corner.  Retain the complete unexpanded hull in the
     # final convex set so root locking can never sacrifice source coverage.
-    locked_points.extend(base_hull)
+    locked_points.extend(support_hull)
     hull = convex_hull_2d(locked_points)
     locked_support = min(Vector(point).dot(axis) for point in hull)
     if abs(float(locked_support - root_support)) > tolerance:
@@ -704,14 +1040,18 @@ def root_locked_expanded_hull(points, margin_ratio, root_axis):
     if not point_in_convex_polygon(attachment, hull, tolerance=tolerance):
         raise ValueError("Root-locked plan no longer contains the XML attachment origin.")
     return hull, {
-        "policy": "xml_root_tangent_preserve_unexpanded_projection_support",
+        "policy": policy,
         "root_axis_xy": [float(axis.x), float(axis.y)],
-        "unexpanded_root_support": float(root_support),
+        "unexpanded_root_support": float(coverage_root_support),
         "unexpanded_distal_support": float(distal_support),
         "locked_root_support": float(locked_support),
         "maximum_root_margin_trim": float(maximum_trim),
         "attachment_xy": [0.0, 0.0],
-        "attachment_inside_unexpanded_projection": True,
+        "attachment_inside_unexpanded_projection": attachment_inside,
+        "attachment_forward_ray_entry": bridge_entry,
+        "attachment_forward_ray_exit": bridge_exit,
+        "attachment_gap_ratio": bridge_gap_ratio,
+        "maximum_attachment_gap_ratio": ROOT_BRIDGE_MAX_GAP_RATIO,
         "tolerance": float(tolerance),
     }
 
@@ -842,6 +1182,65 @@ def _isolate_existing_export_objects(export_collection, reference_collection, jo
     return moved
 
 
+def _hide_source_reference_collection(reference_collection):
+    """Keep rebuild evidence in the blend without exposing it as delivery data."""
+    reference_collection.hide_viewport = True
+    reference_collection.hide_render = True
+    bpy.context.view_layer.update()
+    for obj in tuple(reference_collection.all_objects):
+        if obj is None:
+            continue
+        obj.hide_render = True
+        try:
+            obj.hide_set(True)
+        except RuntimeError:
+            pass
+
+
+def _validate_single_bone_export_contract(export_collection, built_prototypes):
+    expected_armatures = {
+        row["armature"].name for row in built_prototypes.values()
+    }
+    exported_armatures = {
+        obj.name for obj in export_collection.all_objects
+        if obj.type == "ARMATURE"
+        and not obj.name.startswith("__STCLUSTER_BACKUP_")
+    }
+    if exported_armatures != expected_armatures:
+        raise ValueError(
+            "Normalized Export contains an unexpected armature set: "
+            f"expected {sorted(expected_armatures)}, got "
+            f"{sorted(exported_armatures)}."
+        )
+
+    rows = []
+    for row in built_prototypes.values():
+        armature = row["armature"]
+        part = row["part"]
+        bone_names = [bone.name for bone in armature.data.bones]
+        group_names = [group.name for group in part.vertex_groups]
+        if bone_names != ["part_root"]:
+            raise ValueError(
+                f"Normalized export armature '{armature.name}' must contain "
+                f"exactly one part_root bone; got {bone_names}."
+            )
+        if group_names != ["part_root"]:
+            raise ValueError(
+                f"Normalized export mesh '{part.name}' must contain exactly "
+                f"one part_root vertex group; got {group_names}."
+            )
+        rows.append(
+            {
+                "armature": armature.name,
+                "mesh": part.name,
+                "bone_count": 1,
+                "bone": "part_root",
+                "vertex_groups": ["part_root"],
+            }
+        )
+    return rows
+
+
 def _restore_collection_moves(journal):
     for item in reversed(journal.get("collection_moves", [])):
         obj = item["object"]
@@ -938,7 +1337,11 @@ def _build_part_hierarchy(
     journal,
 ):
     mesh_name = asset_name + "_MeshData"
-    transform = frame["matrix_world"].inverted_safe() @ source.matrix_world
+    transform = frame.get("source_to_normalized_matrix")
+    if transform is None:
+        transform = frame["matrix_world"].inverted_safe() @ source.matrix_world
+    else:
+        transform = transform.copy()
     mesh = _split_source_mesh(source, face_indices, transform, mesh_name, journal)
     part = bpy.data.objects.new(asset_name + "_Mesh", mesh)
     journal["objects"].append(part)
@@ -990,6 +1393,26 @@ def _build_part_hierarchy(
     mesh[GENERATED_FLAG] = True
     armature_data[GENERATED_FLAG] = True
     part["speedtree_cluster_frame_world"] = json.dumps(_matrix_rows(frame["matrix_world"]))
+    part["speedtree_cluster_frame_policy"] = str(
+        frame.get("orientation_policy") or ""
+    )
+    if frame.get("source_to_normalized_matrix") is not None:
+        part["speedtree_cluster_source_to_normalized_matrix"] = json.dumps(
+            _matrix_rows(frame["source_to_normalized_matrix"])
+        )
+        part["speedtree_cluster_physical_fit_scale"] = float(
+            frame["physical_fit_scale"]
+        )
+        part["speedtree_cluster_capture_attachment"] = json.dumps(
+            frame["capture_attachment"],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        part["speedtree_cluster_attachment_tangent_projection"] = json.dumps(
+            frame["attachment_tangent_projection"],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
     if frame.get("source_frame_world") is not None:
         part["speedtree_cluster_source_frame_world"] = json.dumps(
             _matrix_rows(frame["source_frame_world"])
@@ -1452,6 +1875,7 @@ def _uniform_plan_triangulation(
     *,
     attachment_point=(0.0, 0.0),
     attachment_uv=None,
+    containment_tolerance=None,
 ):
     """Build a constrained, near-uniform interior instead of an ear-clipped fan."""
     levels = int(refinement_levels)
@@ -1482,11 +1906,22 @@ def _uniform_plan_triangulation(
         math.isfinite(value) for value in attachment_uv
     ):
         raise ValueError("Plan attachment UV is malformed.")
+    if containment_tolerance is None:
+        containment_tolerance = max(diagonal * 1.0e-7, 1.0e-9)
+    try:
+        containment_tolerance = float(containment_tolerance)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Plan attachment containment tolerance is malformed.") from exc
+    if (
+        not math.isfinite(containment_tolerance)
+        or containment_tolerance <= 0.0
+    ):
+        raise ValueError("Plan attachment containment tolerance must be positive.")
     boundary_points = list(points)
     if not point_in_convex_polygon(
         attachment_point,
         boundary_points,
-        tolerance=diagonal * diagonal * 1.0e-12,
+        tolerance=containment_tolerance,
     ):
         raise ValueError("Plan boundary does not contain its normalized attachment origin.")
 
@@ -1788,44 +2223,132 @@ def _build_plan(
     plan_refinement_levels,
     source_3d_contract,
     journal,
+    physical_capture_contract=None,
 ):
     right = Vector(projection_basis["right"])
     up = Vector(projection_basis["up"])
     normal = Vector(projection_basis["normal"])
-    axis_tolerance = 1.0e-7
+    axis_tolerance = 1.0e-6
+    if min(right.length, up.length, normal.length) <= axis_tolerance:
+        raise ValueError("Generated plan projection basis contains a zero-length axis.")
+    right.normalize()
+    up.normalize()
+    normal.normalize()
     if (
+        abs(right.dot(up)) > axis_tolerance
+        or abs(right.dot(normal)) > axis_tolerance
+        or abs(up.dot(normal)) > axis_tolerance
+        or right.cross(up).dot(normal) < 1.0 - axis_tolerance
+    ):
+        raise ValueError(
+            "Generated plan projection basis is not right-handed orthonormal: "
+            f"right_up={right.dot(up):.9g}, "
+            f"right_normal={right.dot(normal):.9g}, "
+            f"up_normal={up.dot(normal):.9g}, "
+            f"handedness={right.cross(up).dot(normal):.9g}."
+        )
+    if physical_capture_contract is None and (
         (right - Vector((1.0, 0.0, 0.0))).length > axis_tolerance
         or (up - Vector((0.0, 1.0, 0.0))).length > axis_tolerance
         or (normal - Vector((0.0, 0.0, 1.0))).length > axis_tolerance
     ):
-        raise ValueError("Generated plans require the shared camera-aligned local XY frame.")
+        raise ValueError(
+            "Legacy generated plans require the shared camera-aligned local XY frame."
+        )
     points = [
-        (float(point.x), float(point.y))
+        (float(point.dot(right)), float(point.dot(up)))
         for point in coverage_points
     ]
     attachment_point = (0.0, 0.0)
     xml_attachment = frame.get("xml_attachment")
     if not isinstance(xml_attachment, dict):
         raise ValueError("Generated plans require a validated XML physical attachment.")
-    xml_direction_world = Vector(xml_attachment["xml_end_world"]) - Vector(
-        xml_attachment["xml_start_world"]
+    xml_direction_world = (
+        attachment_endpoint_world(xml_attachment)
+        - attachment_origin_world(xml_attachment)
     )
+    root_direction_world = xml_direction_world
+    root_direction_policy = "xml_attachment_direction"
+    if physical_capture_contract is not None:
+        tangent = frame.get("attachment_tangent_projection") or {}
+        try:
+            root_direction_world = Vector(
+                tangent["aligned_capture_plane_world"]
+            )
+            root_direction_policy = str(tangent["direction_policy"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Physical capture frame lacks its resolved in-plane attachment "
+                "direction."
+            ) from exc
     root_direction_local = (
-        frame["matrix_world"].inverted_safe().to_3x3() @ xml_direction_world
+        frame["matrix_world"].inverted_safe().to_3x3()
+        @ root_direction_world
     )
     hull, root_lock = root_locked_expanded_hull(
         points,
         margin_ratio,
-        (root_direction_local.x, root_direction_local.y),
+        (
+            float(root_direction_local.dot(right)),
+            float(root_direction_local.dot(up)),
+        ),
     )
-    transferred_uvs, transfer = _transfer_camera_boundary_uvs(
-        hull,
-        reference_plane,
-        uv_bundle["contract"]["camera"],
-        plan_attachment_xy=attachment_point,
-    )
-    boundary_uvs = transferred_uvs.tolist()
-    pivot_uv = (reference_plane.get("attachment") or {}).get("pivot_uv")
+    root_lock["direction_policy"] = root_direction_policy
+    if physical_capture_contract is not None:
+        capture_frame = physical_capture_contract["frame"]
+        capture_center = Vector(capture_frame["center"])
+        capture_right = Vector(capture_frame["right"])
+        capture_up = Vector(capture_frame["up"])
+        capture_width = float(capture_frame["width"])
+        capture_height = float(capture_frame["height"])
+
+        def direct_uv(point):
+            fitted_world = frame["matrix_world"] @ (
+                right * float(point[0]) + up * float(point[1])
+            )
+            relative = fitted_world - capture_center
+            return [
+                0.5 + float(relative.dot(capture_right)) / capture_width,
+                0.5 + float(relative.dot(capture_up)) / capture_height,
+            ]
+
+        boundary_uvs = [direct_uv(point) for point in hull]
+        pivot_uv = direct_uv(attachment_point)
+        uv_values = [
+            coordinate for uv in boundary_uvs + [pivot_uv] for coordinate in uv
+        ]
+        if min(uv_values) < -1.0e-6 or max(uv_values) > 1.0 + 1.0e-6:
+            raise ValueError(
+                "Direct-capture plan exceeds the physical capture frame: "
+                f"{plan_name}; uv_min={min(uv_values):.9g}, "
+                f"uv_max={max(uv_values):.9g}"
+            )
+        transfer = {
+            "policy": "direct_physical_capture_projection",
+            "direct_uv_source": DIRECT_CAPTURE_UV_SOURCE,
+            "capture_contract_sha256": physical_capture_contract[
+                "contract_sha256"
+            ],
+            "capture_plane": capture_frame["plane"],
+            "capture_center": list(capture_frame["center"]),
+            "capture_width": capture_width,
+            "capture_height": capture_height,
+            "capture_attachment": dict(frame["capture_attachment"]),
+            "attachment_tangent_projection": dict(
+                frame["attachment_tangent_projection"]
+            ),
+            "plan_attachment_xy": [0.0, 0.0],
+            "attachment_vertex_uv": [float(value) for value in pivot_uv],
+        }
+    else:
+        transferred_uvs, transfer = _transfer_camera_boundary_uvs(
+            hull,
+            reference_plane,
+            uv_bundle["contract"]["camera"],
+            plan_attachment_xy=attachment_point,
+        )
+        boundary_uvs = transferred_uvs.tolist()
+        pivot_uv = (reference_plane.get("attachment") or {}).get("pivot_uv")
     triangulated_points, refined_uvs, faces, attachment_vertex_index = (
         _uniform_plan_triangulation(
             hull,
@@ -1833,14 +2356,15 @@ def _build_plan(
             plan_refinement_levels,
             attachment_point=attachment_point,
             attachment_uv=pivot_uv,
+            containment_tolerance=root_lock["tolerance"],
         )
     )
     boundary_vertices = [
-        (float(point[0]), float(point[1]), 0.0)
+        tuple(right * float(point[0]) + up * float(point[1]))
         for point in hull
     ]
     vertices = [
-        (float(point[0]), float(point[1]), 0.0)
+        tuple(right * float(point[0]) + up * float(point[1]))
         for point in triangulated_points
     ]
     mesh = bpy.data.meshes.new(plan_name + "_Mesh")
@@ -1869,6 +2393,9 @@ def _build_plan(
     _tag(plan, source, bone_name, endpoint_name, "speedtree_plan", index, skeletal_name)
     mesh[GENERATED_FLAG] = True
     plan["speedtree_cluster_frame_world"] = json.dumps(_matrix_rows(frame["matrix_world"]))
+    plan["speedtree_cluster_frame_policy"] = str(
+        frame.get("orientation_policy") or ""
+    )
     if frame.get("source_frame_world") is not None:
         plan["speedtree_cluster_source_frame_world"] = json.dumps(
             _matrix_rows(frame["source_frame_world"])
@@ -1898,14 +2425,6 @@ def _build_plan(
     )
     transfer.update(
         {
-            "reference_plane": reference_plane["name"],
-            "reference_object": reference_object.name,
-            "source_mesh_id": int(reference_plane["source_mesh_id"]),
-            "reference_topology_sha256": reference_plane["topology_sha256"],
-            "reference_uv_sha256": reference_plane["uv_sha256"],
-            "contract_sha256": uv_bundle["contract_sha256"],
-            "reference_blend": uv_bundle["reference_blend"],
-            "reference_blend_sha256": uv_bundle["reference_blend_sha256"],
             "result_uvs": stored_uvs,
             "projection_basis": projection_basis,
             "prototype_index": int(prototype_index),
@@ -1921,11 +2440,54 @@ def _build_plan(
             "plan_root_lock": root_lock,
         }
     )
+    if physical_capture_contract is None:
+        transfer.update(
+            {
+                "reference_plane": reference_plane["name"],
+                "reference_object": reference_object.name,
+                "source_mesh_id": int(reference_plane["source_mesh_id"]),
+                "reference_topology_sha256": reference_plane[
+                    "topology_sha256"
+                ],
+                "reference_uv_sha256": reference_plane["uv_sha256"],
+                "contract_sha256": uv_bundle["contract_sha256"],
+                "reference_blend": uv_bundle["reference_blend"],
+                "reference_blend_sha256": uv_bundle[
+                    "reference_blend_sha256"
+                ],
+            }
+        )
     transfer["result_uv_sha256"] = _canonical_sha256(transfer["result_uvs"])
-    plan[CAMERA_CONTRACT_HASH_KEY] = uv_bundle["contract_sha256"]
-    plan[CAMERA_REFERENCE_KEY] = reference_object.name
-    plan[UV_TRANSFER_KEY] = json.dumps(transfer, ensure_ascii=False, sort_keys=True)
-    mesh[CAMERA_CONTRACT_HASH_KEY] = uv_bundle["contract_sha256"]
+    if physical_capture_contract is not None:
+        capture_hash = physical_capture_contract["contract_sha256"]
+        plan[PHYSICAL_CAPTURE_CONTRACT_HASH_KEY] = capture_hash
+        plan[DIRECT_CAPTURE_UV_KEY] = json.dumps(
+            transfer, ensure_ascii=False, sort_keys=True
+        )
+        plan["speedtree_cluster_uv_policy"] = (
+            "direct_physical_capture_projection"
+        )
+        plan["speedtree_cluster_physical_fit_scale"] = float(
+            frame["physical_fit_scale"]
+        )
+        plan["speedtree_cluster_capture_attachment"] = json.dumps(
+            frame["capture_attachment"],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        plan["speedtree_cluster_attachment_tangent_projection"] = json.dumps(
+            frame["attachment_tangent_projection"],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        mesh[PHYSICAL_CAPTURE_CONTRACT_HASH_KEY] = capture_hash
+    else:
+        plan[CAMERA_CONTRACT_HASH_KEY] = uv_bundle["contract_sha256"]
+        plan[CAMERA_REFERENCE_KEY] = reference_object.name
+        plan[UV_TRANSFER_KEY] = json.dumps(
+            transfer, ensure_ascii=False, sort_keys=True
+        )
+        mesh[CAMERA_CONTRACT_HASH_KEY] = uv_bundle["contract_sha256"]
 
     maximum_plane_error = max(
         abs(float(Vector(vertex).dot(normal))) for vertex in vertices
@@ -1996,6 +2558,8 @@ def build_normalized_cluster_assets(
     whole_mesh_pivot_object=None,
     plan_refinement_levels=1,
     source_xml_path="",
+    workflow_mode=WORKFLOW_LEGACY_CAMERA_UV,
+    physical_capture_contract=None,
 ):
     if context.mode != "OBJECT":
         raise ValueError("Cluster normalization must start in Object Mode.")
@@ -2005,6 +2569,9 @@ def build_normalized_cluster_assets(
     plan_material_name = plan_material_name.strip()
     source_reference_collection_name = source_reference_collection_name.strip()
     source_partition_mode = str(source_partition_mode or "AUTO").strip().upper()
+    workflow_mode = str(
+        workflow_mode or WORKFLOW_LEGACY_CAMERA_UV
+    ).strip().upper()
     plan_refinement_levels = int(plan_refinement_levels)
     if plan_refinement_levels < 0 or plan_refinement_levels > 2:
         raise ValueError("Plan refinement levels must be between 0 and 2.")
@@ -2037,14 +2604,39 @@ def build_normalized_cluster_assets(
         )
     if not plan_material_name:
         raise ValueError("Plan material name cannot be empty.")
-    if not isinstance(camera_uv_bundle, dict) or not camera_uv_bundle.get("contract"):
-        raise ValueError(
-            "Exact camera SPM UV contract is required; run through the Cluster operator preflight."
-        )
-    if camera_uv_bundle.get("contract_sha256") != _canonical_sha256(
-        camera_uv_bundle["contract"]
-    ):
-        raise ValueError("Camera SPM UV contract hash mismatch before normalization.")
+    if workflow_mode == WORKFLOW_LEGACY_CAMERA_UV:
+        if not isinstance(camera_uv_bundle, dict) or not camera_uv_bundle.get(
+            "contract"
+        ):
+            raise ValueError(
+                "Exact camera SPM UV contract is required only for the explicit "
+                "LEGACY_CAMERA_UV workflow."
+            )
+        if camera_uv_bundle.get("contract_sha256") != _canonical_sha256(
+            camera_uv_bundle["contract"]
+        ):
+            raise ValueError(
+                "Camera SPM UV contract hash mismatch before normalization."
+            )
+        if physical_capture_contract is not None:
+            raise ValueError(
+                "LEGACY_CAMERA_UV cannot consume a physical capture contract."
+            )
+        physical_capture_frame = None
+        physical_capture_hash = None
+    elif workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE:
+        if camera_uv_bundle is not None:
+            raise ValueError(
+                "PHYSICAL_DIRECT_CAPTURE must not read a SpeedTree camera UV "
+                "bundle or camera reference."
+            )
+        (
+            physical_capture_contract,
+            physical_capture_frame,
+            physical_capture_hash,
+        ) = _validate_physical_capture_contract(physical_capture_contract)
+    else:
+        raise ValueError(f"Unsupported workflow mode: {workflow_mode}")
     unsupported_modifiers = [
         modifier.name for modifier in source.modifiers if modifier.type != "ARMATURE"
     ]
@@ -2078,11 +2670,37 @@ def build_normalized_cluster_assets(
         name for name, faces in assignments["faces"].items() if faces
     }
     bones = [bone for bone in armature.data.bones if bone.name in populated]
-    reference_planes = camera_uv_bundle["contract"].get("planes") or []
-    if not reference_planes:
-        raise ValueError("Camera UV contract contains no card planes.")
-    camera_contract = camera_uv_bundle["contract"].get("camera") or {}
-    _camera_world_axes(camera_contract)
+    if workflow_mode == WORKFLOW_LEGACY_CAMERA_UV:
+        reference_planes = camera_uv_bundle["contract"].get("planes") or []
+        if not reference_planes:
+            raise ValueError("Camera UV contract contains no card planes.")
+        camera_contract = camera_uv_bundle["contract"].get("camera") or {}
+        _camera_world_axes(camera_contract)
+    else:
+        reference_planes = [
+            None for _root in attachment_contract.get("roots") or []
+        ]
+        if not reference_planes:
+            raise ValueError(
+                "Physical direct capture source XML contains no attachment roots."
+            )
+        camera_contract = _physical_capture_camera(physical_capture_frame)
+        _camera_world_axes(camera_contract)
+
+    def aligned_frame(source_frame, vertex_indices):
+        if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE:
+            return physical_capture_aligned_frame(
+                source,
+                source_frame,
+                vertex_indices,
+                physical_capture_frame,
+            )
+        return camera_aligned_frame(
+            source,
+            source_frame,
+            vertex_indices,
+            camera_contract,
+        )
 
     valid_per_deform_rows = []
     per_deform_error = None
@@ -2158,11 +2776,9 @@ def build_normalized_cluster_assets(
                 )
             whole_pivot = _whole_mesh_pivot(source, whole_mesh_pivot_object)
             composite_source_frame = whole_mesh_frame(source, whole_pivot)
-            composite_frame = camera_aligned_frame(
-                source,
+            composite_frame = aligned_frame(
                 composite_source_frame,
                 range(len(source.data.vertices)),
-                camera_contract,
             )
         for index, (_ordinal, bone) in enumerate(valid_per_deform_rows, 1):
             endpoint_bone, endpoint_policy = _preferred_endpoint_bone(bone, populated)
@@ -2186,6 +2802,14 @@ def build_normalized_cluster_assets(
                 geometry_scale,
                 used_xml_root_ids,
             )
+            attachment = fit_attachment_to_geometry(
+                attachment,
+                [
+                    source.matrix_world @ source.data.vertices[value].co
+                    for value in vertex_indices
+                ],
+                geometry_scale,
+            )
             source_frame = canonical_frame(
                 source,
                 armature,
@@ -2199,16 +2823,16 @@ def build_normalized_cluster_assets(
                     "index": index,
                     "asset_name": f"{skeletal_base_name}_{index:02d}",
                     "bone_name": bone.name,
-                    "endpoint_name": endpoint_bone.name,
+                    "endpoint_name": (
+                        endpoint_bone.name if endpoint_bone is not None else ""
+                    ),
                     "endpoint_policy": endpoint_policy,
                     "source_bones": [bone.name],
                     "face_indices": face_indices,
                     "xml_attachment": serialized_attachment(attachment),
-                    "frame": camera_aligned_frame(
-                        source,
+                    "frame": aligned_frame(
                         source_frame,
                         vertex_indices,
-                        camera_contract,
                     ),
                 }
             )
@@ -2252,6 +2876,14 @@ def build_normalized_cluster_assets(
                 geometry_scale,
                 used_xml_root_ids,
             )
+            attachment = fit_attachment_to_geometry(
+                attachment,
+                [
+                    source.matrix_world @ source.data.vertices[value].co
+                    for value in vertex_indices
+                ],
+                geometry_scale,
+            )
             endpoint_name = endpoint_bone.name if endpoint_bone is not None else ""
             source_frame = canonical_frame(
                 source,
@@ -2261,11 +2893,9 @@ def build_normalized_cluster_assets(
                 vertex_indices,
                 attachment=attachment,
             )
-            frame = camera_aligned_frame(
-                source,
+            frame = aligned_frame(
                 source_frame,
                 vertex_indices,
-                camera_contract,
             )
             prototypes.append(
                 {
@@ -2305,11 +2935,22 @@ def build_normalized_cluster_assets(
             "end_match_error": 0.0,
             "match_tolerance": 0.0,
         }
-        source_frame["matrix_world"].translation = xml_root["start_world"]
-        source_frame["origin_world"] = [float(value) for value in xml_root["start_world"]]
-        source_frame["endpoint_world"] = [float(value) for value in xml_root["end_world"]]
+        whole_world_points = [
+            source.matrix_world @ vertex.co for vertex in source.data.vertices
+        ]
+        whole_geometry_scale = max(_bounds(whole_world_points)["size"])
+        attachment = fit_attachment_to_geometry(
+            attachment,
+            whole_world_points,
+            whole_geometry_scale,
+        )
+        effective_origin = attachment_origin_world(attachment)
+        effective_endpoint = attachment_endpoint_world(attachment)
+        source_frame["matrix_world"].translation = effective_origin
+        source_frame["origin_world"] = [float(value) for value in effective_origin]
+        source_frame["endpoint_world"] = [float(value) for value in effective_endpoint]
         source_frame["endpoint_length"] = float(
-            (xml_root["end_world"] - xml_root["start_world"]).length
+            (effective_endpoint - effective_origin).length
         )
         source_frame["xml_attachment"] = serialized_attachment(attachment)
         used_xml_root_ids.add(xml_root["id"])
@@ -2323,11 +2964,9 @@ def build_normalized_cluster_assets(
                 "source_bones": [],
                 "face_indices": [polygon.index for polygon in source.data.polygons],
                 "xml_attachment": serialized_attachment(attachment),
-                "frame": camera_aligned_frame(
-                    source,
+                "frame": aligned_frame(
                     source_frame,
                     range(len(source.data.vertices)),
-                    camera_contract,
                 ),
             }
         )
@@ -2338,6 +2977,27 @@ def build_normalized_cluster_assets(
             "Normalized prototypes do not map 1:1 to XML structural roots: "
             f"used={sorted(used_xml_root_ids)}, expected={sorted(expected_xml_root_ids)}."
         )
+    if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE:
+        physical_capture_contract = json.loads(
+            json.dumps(physical_capture_contract, ensure_ascii=False)
+        )
+        physical_capture_contract["attachment_pivots"] = [
+            {
+                "prototype_index": int(prototype["index"]),
+                "prototype_asset": prototype["asset_name"],
+                "xml_bone_id": int(
+                    prototype["xml_attachment"]["xml_bone_id"]
+                ),
+                **dict(prototype["frame"]["capture_attachment"]),
+                "attachment_tangent_projection": dict(
+                    prototype["frame"]["attachment_tangent_projection"]
+                ),
+            }
+            for prototype in prototypes
+        ]
+        physical_capture_contract.pop("contract_sha256", None)
+        physical_capture_hash = _canonical_sha256(physical_capture_contract)
+        physical_capture_contract["contract_sha256"] = physical_capture_hash
 
     composite_parts = []
     composite_set_id = None
@@ -2407,7 +3067,10 @@ def build_normalized_cluster_assets(
             ]
         )
     desired_names.extend(card["plan_name"] for card in cards)
-    desired_names.extend("AtlasCameraRef_" + plane["name"] for plane in reference_planes)
+    if workflow_mode == WORKFLOW_LEGACY_CAMERA_UV:
+        desired_names.extend(
+            "AtlasCameraRef_" + plane["name"] for plane in reference_planes
+        )
 
     if len(desired_names) != len(set(desired_names)):
         raise ValueError("Canonical output names are not unique.")
@@ -2421,8 +3084,12 @@ def build_normalized_cluster_assets(
         obj.name
         for obj in bpy.data.objects
         if _is_generated(obj)
-        and str(obj.get(PROTOTYPE_ASSET_KEY) or "").startswith(
-            skeletal_base_name + "_"
+        and (
+            str(obj.get(PROTOTYPE_ASSET_KEY) or "").startswith(
+                skeletal_base_name + "_"
+            )
+            or obj.name.startswith(plan_base_name + "_")
+            or obj.name.startswith("AtlasCameraRef_" + plan_base_name + "_")
         )
         and obj.name not in desired_names
     ]
@@ -2444,25 +3111,31 @@ def build_normalized_cluster_assets(
     try:
         export_collection, export_created = _ensure_collection(context.scene, "Export")
         plan_collection, plan_created = _ensure_collection(context.scene, plan_collection_name)
-        camera_reference_collection, camera_reference_created = _ensure_collection(
-            context.scene,
-            camera_uv_bundle["reference_collection"],
-        )
+        camera_reference_collection = None
+        camera_reference_created = False
+        if workflow_mode == WORKFLOW_LEGACY_CAMERA_UV:
+            camera_reference_collection, camera_reference_created = _ensure_collection(
+                context.scene,
+                camera_uv_bundle["reference_collection"],
+            )
         if export_created:
             journal["collections"].append(export_collection)
         if plan_created:
             journal["collections"].append(plan_collection)
         if camera_reference_created:
             journal["collections"].append(camera_reference_collection)
-        camera_references = _load_camera_reference_objects(
-            context.scene,
-            source,
-            cards,
-            plan_material_name,
-            camera_uv_bundle,
-            camera_reference_collection,
-            journal,
-        )
+        if workflow_mode == WORKFLOW_LEGACY_CAMERA_UV:
+            camera_references = _load_camera_reference_objects(
+                context.scene,
+                source,
+                cards,
+                plan_material_name,
+                camera_uv_bundle,
+                camera_reference_collection,
+                journal,
+            )
+        else:
+            camera_references = [None for _card in cards]
         isolated_export_objects = []
         if isolate_send2ue_export and export_collection.objects:
             reference_collection, reference_created = _ensure_collection(
@@ -2476,6 +3149,7 @@ def build_normalized_cluster_assets(
                 reference_collection,
                 journal,
             )
+            _hide_source_reference_collection(reference_collection)
         built_prototypes = {}
         prototype_reports = []
         for prototype in prototypes:
@@ -2513,6 +3187,13 @@ def build_normalized_cluster_assets(
                     ensure_ascii=False,
                     sort_keys=True,
                 )
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE:
+                    obj[PHYSICAL_CAPTURE_CONTRACT_HASH_KEY] = (
+                        physical_capture_hash
+                    )
+                    obj["speedtree_cluster_physical_fit_scale"] = float(
+                        physical_capture_frame["fit_scale"]
+                    )
             built_prototypes[prototype["index"]] = {
                 "pivot": pivot,
                 "armature": part_armature,
@@ -2541,6 +3222,12 @@ def build_normalized_cluster_assets(
                         else None
                     ),
                     "frame_policy": prototype["frame"].get("orientation_policy"),
+                    "attachment_tangent_projection": dict(
+                        prototype["frame"].get(
+                            "attachment_tangent_projection"
+                        )
+                        or {}
+                    ),
                     "subpart_to_card_matrix": (
                         _matrix_rows(prototype["subpart_to_card_matrix"])
                         if prototype.get("subpart_to_card_matrix") is not None
@@ -2574,11 +3261,11 @@ def build_normalized_cluster_assets(
                     vertex.co.copy() for vertex in part.data.vertices
                 ]
             projection_basis = camera_projection_basis_in_part(
-                prototype["frame"], camera_uv_bundle["contract"]["camera"]
+                prototype["frame"], camera_contract
             )
             if resolved_partition_mode == "COMPOSITE_PER_DEFORM_ROOT":
                 projection_basis = camera_projection_basis_in_part(
-                    card["frame"], camera_uv_bundle["contract"]["camera"]
+                    card["frame"], camera_contract
                 )
             plan, hull, uv_transfer, projection_coverage, plan_root_lock = _build_plan(
                 source,
@@ -2602,6 +3289,11 @@ def build_normalized_cluster_assets(
                 plan_refinement_levels,
                 source_3d_contract,
                 journal,
+                physical_capture_contract=(
+                    physical_capture_contract
+                    if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                    else None
+                ),
             )
             if card["composite_parts"]:
                 plan[COMPOSITE_PARTS_KEY] = json.dumps(
@@ -2673,9 +3365,41 @@ def build_normalized_cluster_assets(
                     "normalized_bounds": _bounds(coverage_points),
                     "plan_hull": [[float(value) for value in point] for point in hull],
                     "projection_basis": projection_basis,
-                    "camera_reference": reference_object.name,
-                    "camera_source_mesh_id": int(reference_plane["source_mesh_id"]),
-                    "camera_reference_uv_sha256": reference_plane["uv_sha256"],
+                    "camera_reference": (
+                        reference_object.name
+                        if reference_object is not None
+                        else None
+                    ),
+                    "camera_source_mesh_id": (
+                        int(reference_plane["source_mesh_id"])
+                        if reference_plane is not None
+                        else None
+                    ),
+                    "camera_reference_uv_sha256": (
+                        reference_plane["uv_sha256"]
+                        if reference_plane is not None
+                        else None
+                    ),
+                    "physical_capture_contract_sha256": (
+                        physical_capture_hash
+                        if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                        else None
+                    ),
+                    "physical_fit_scale": (
+                        float(card["frame"]["physical_fit_scale"])
+                        if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                        else None
+                    ),
+                    "capture_attachment": (
+                        dict(card["frame"]["capture_attachment"])
+                        if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                        else None
+                    ),
+                    "attachment_tangent_projection": (
+                        dict(card["frame"]["attachment_tangent_projection"])
+                        if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                        else None
+                    ),
                     "plan_uv_transfer": uv_transfer,
                     "materials": [
                         material.name if material else None for material in part.data.materials
@@ -2684,8 +3408,13 @@ def build_normalized_cluster_assets(
                     "color_attributes": [attribute.name for attribute in part.data.color_attributes],
                 }
             )
+        export_rig_contract = _validate_single_bone_export_contract(
+            export_collection,
+            built_prototypes,
+        )
         report = {
             "schema_version": 2,
+            "workflow_mode": workflow_mode,
             "source_object": source.name,
             "source_armature": armature.name,
             "source_3d_contract": source_3d_contract,
@@ -2708,6 +3437,7 @@ def build_normalized_cluster_assets(
             "send2ue": send2ue,
             "send2ue_export_isolated": bool(isolate_send2ue_export),
             "isolated_export_objects": isolated_export_objects,
+            "export_rig_contract": export_rig_contract,
             "source_reference_collection": (
                 source_reference_collection_name if isolate_send2ue_export else None
             ),
@@ -2715,24 +3445,113 @@ def build_normalized_cluster_assets(
             "unweighted_vertex_count": len(assignments["unweighted_vertices"]),
             "dominant_weight_tie_count": len(assignments["tied_vertices"]),
             "normalization_policy": (
-                "validated_attachment_origin_with_shared_camera_aligned_rigid_frame"
+                "validated_attachment_origin_with_physical_uniform_fit_and_shared_axes"
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else "validated_attachment_origin_with_shared_camera_aligned_rigid_frame"
             ),
-            "size_policy": "source_relative_only_no_absolute_dimensions",
+            "size_policy": (
+                "uniform_whole_source_physical_target_meters"
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else "source_relative_only_no_absolute_dimensions"
+            ),
             "plan_policy": (
-                "camera_aligned_local_xy_orthogonal_projection_with_pinned_attachment"
+                "same_blender_capture_direct_projection_with_pinned_attachment"
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else "camera_aligned_local_xy_orthogonal_projection_with_pinned_attachment"
             ),
             "plan_refinement_levels": plan_refinement_levels,
-            "plan_uv_policy": "exact_camera_reference_closed_loop_similarity_transfer",
-            "camera_reference_collection": camera_reference_collection.name,
-            "camera_uv_contract_sha256": camera_uv_bundle["contract_sha256"],
-            "camera_reference_blend": camera_uv_bundle["reference_blend"],
-            "camera_reference_blend_sha256": camera_uv_bundle[
-                "reference_blend_sha256"
-            ],
-            "camera_manifest": camera_uv_bundle["manifest_path"],
-            "camera_manifest_sha256": camera_uv_bundle["manifest_sha256"],
-            "camera_tree_file_changed_since_reference_build": camera_uv_bundle.get(
-                "tree_file_changed_since_reference_build", False
+            "plan_uv_policy": (
+                "direct_physical_capture_projection"
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else "exact_camera_reference_closed_loop_similarity_transfer"
+            ),
+            "physical_capture_contract": (
+                physical_capture_contract
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else None
+            ),
+            "physical_capture_contract_sha256": (
+                physical_capture_hash
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else None
+            ),
+            "physical_target_meters": (
+                list(physical_capture_frame["target_meters"])
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else None
+            ),
+            "physical_target_blender_units": (
+                list(physical_capture_frame["target_blender_units"])
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else None
+            ),
+            "physical_fit_scale": (
+                float(physical_capture_frame["fit_scale"])
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else None
+            ),
+            "direct_uv_source": (
+                DIRECT_CAPTURE_UV_SOURCE
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else None
+            ),
+            "capture_manifest": (
+                physical_capture_contract.get("capture_manifest")
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else None
+            ),
+            "capture_manifest_sha256": (
+                None
+            ),
+            "capture_maps": (
+                list(physical_capture_contract.get("capture_maps") or [])
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else []
+            ),
+            "camera_dependency": (
+                "none"
+                if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                else "explicit_legacy_camera_uv_contract"
+            ),
+            "generator_size_policy": (
+                "preserve_user_authored_leaf_and_frond_dimensions"
+            ),
+            "camera_reference_collection": (
+                camera_reference_collection.name
+                if camera_reference_collection is not None
+                else None
+            ),
+            "camera_uv_contract_sha256": (
+                camera_uv_bundle["contract_sha256"]
+                if camera_uv_bundle is not None
+                else None
+            ),
+            "camera_reference_blend": (
+                camera_uv_bundle["reference_blend"]
+                if camera_uv_bundle is not None
+                else None
+            ),
+            "camera_reference_blend_sha256": (
+                camera_uv_bundle["reference_blend_sha256"]
+                if camera_uv_bundle is not None
+                else None
+            ),
+            "camera_manifest": (
+                camera_uv_bundle["manifest_path"]
+                if camera_uv_bundle is not None
+                else None
+            ),
+            "camera_manifest_sha256": (
+                camera_uv_bundle["manifest_sha256"]
+                if camera_uv_bundle is not None
+                else None
+            ),
+            "camera_tree_file_changed_since_reference_build": (
+                camera_uv_bundle.get(
+                    "tree_file_changed_since_reference_build", False
+                )
+                if camera_uv_bundle is not None
+                else False
             ),
             "variants": records,
         }
@@ -2754,6 +3573,11 @@ def build_normalized_cluster_assets(
                     "card_index": row["card_index"],
                     "plan": row["plan"],
                     "source_mesh_id": row["camera_source_mesh_id"],
+                    "uv_source": (
+                        DIRECT_CAPTURE_UV_SOURCE
+                        if workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
+                        else "legacy_camera_uv_reference"
+                    ),
                     "prototype_index": row["prototype_index"],
                     "prototype_asset": row["prototype_asset"],
                     "xml_bone_id": row["xml_attachment"]["xml_bone_id"],
@@ -2775,22 +3599,47 @@ def build_normalized_cluster_assets(
         context.scene[SOURCE_3D_CONTRACT_HASH_KEY] = _canonical_sha256(
             source_3d_contract
         )
-        persisted_bundle = {
-            key: value
-            for key, value in camera_uv_bundle.items()
-            if key != "contract"
-        }
-        context.scene["speedtree_cluster_camera_uv_bundle"] = json.dumps(
-            persisted_bundle,
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        context.scene[CAMERA_CONTRACT_KEY] = json.dumps(
-            camera_uv_bundle["contract"],
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        context.scene[CAMERA_CONTRACT_HASH_KEY] = camera_uv_bundle["contract_sha256"]
+        if workflow_mode == WORKFLOW_LEGACY_CAMERA_UV:
+            persisted_bundle = {
+                key: value
+                for key, value in camera_uv_bundle.items()
+                if key != "contract"
+            }
+            context.scene["speedtree_cluster_camera_uv_bundle"] = json.dumps(
+                persisted_bundle,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            context.scene[CAMERA_CONTRACT_KEY] = json.dumps(
+                camera_uv_bundle["contract"],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            context.scene[CAMERA_CONTRACT_HASH_KEY] = camera_uv_bundle[
+                "contract_sha256"
+            ]
+            for key in (
+                PHYSICAL_CAPTURE_CONTRACT_KEY,
+                PHYSICAL_CAPTURE_CONTRACT_HASH_KEY,
+            ):
+                if key in context.scene:
+                    del context.scene[key]
+        else:
+            context.scene[PHYSICAL_CAPTURE_CONTRACT_KEY] = json.dumps(
+                physical_capture_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            context.scene[PHYSICAL_CAPTURE_CONTRACT_HASH_KEY] = (
+                physical_capture_hash
+            )
+            for key in (
+                "speedtree_cluster_camera_uv_bundle",
+                CAMERA_CONTRACT_KEY,
+                CAMERA_CONTRACT_HASH_KEY,
+            ):
+                if key in context.scene:
+                    del context.scene[key]
         context.scene["speedtree_cluster_normalizer_last_report"] = json.dumps(
             report,
             ensure_ascii=False,

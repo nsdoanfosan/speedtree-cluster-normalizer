@@ -20,6 +20,26 @@ def mesh_source_poll(_self, obj):
 
 
 class STCLUSTER_Properties(PropertyGroup):
+    workflow_mode: EnumProperty(
+        name="Production Workflow",
+        items=(
+            (
+                "LEGACY_CAMERA_UV",
+                "Legacy Camera UV",
+                "Preserve the existing SpeedTree camera-template UV transfer workflow",
+            ),
+            (
+                "PHYSICAL_DIRECT_CAPTURE",
+                "Physical Direct Capture",
+                "Uniformly fit the complete source layout into a physical target and derive plan UVs from the same Blender capture",
+            ),
+        ),
+        default="PHYSICAL_DIRECT_CAPTURE",
+        description=(
+            "Explicitly isolates legacy SpeedTree camera UV transfer from the "
+            "physical Blender direct-capture production contract"
+        ),
+    )
     source_object: PointerProperty(
         name="3D Cluster Source",
         type=bpy.types.Object,
@@ -171,19 +191,126 @@ class STCLUSTER_Properties(PropertyGroup):
         default="",
         description="Existing SpeedTree SPM to add to the Atlas Target SPM list",
     )
+    unit_probe_contract_path: StringProperty(
+        name="Verified Unit Probe",
+        subtype="FILE_PATH",
+        default="",
+        description=(
+            "Verified role-independent Blender-to-SpeedTree FBX/SPM unit-probe "
+            "receipt required by Physical Direct Capture production"
+        ),
+    )
     atlas_only_target: BoolProperty(
         name="Use Only This Target",
         default=False,
         description="Replace the Atlas target list with this SPM; use only in a dedicated cluster blend",
     )
     atlas_mesh_scale: FloatProperty(
-        name="Atlas Mesh Scale",
-        default=1.0,
+        name="Atlas FBX Geometry Scale",
+        default=0.01,
         min=0.000001,
         soft_max=10.0,
         precision=6,
         description=(
-            "Geometry scale passed to Atlas; 1.0 preserves the normalized 3D/plan size relationship"
+            "Bake the Blender-to-SpeedTree unit conversion into the generated "
+            "FBX geometry so every SpeedTree generator type exports consistently"
         ),
+    )
+    atlas_mesh_asset_scale: FloatProperty(
+        name="SpeedTree Mesh Asset Scale",
+        default=1.0,
+        min=0.000001,
+        soft_max=1.0,
+        precision=6,
+        description=(
+            "Scale written to every generated SpeedTree Mesh asset; keep at 1.0 "
+            "when the unit conversion is baked into the generated FBX geometry"
+        ),
+    )
+    capture_source_collection: StringProperty(
+        name="Capture Source Collection",
+        default="SpeedTree_Source",
+        description=(
+            "Collection containing the original 3D source meshes rendered into the "
+            "eight SpeedTree map files"
+        ),
+    )
+    capture_output_dir: StringProperty(
+        name="Capture Output Folder",
+        subtype="DIR_PATH",
+        default="",
+        description="Folder that receives the eight Color, Opacity, Normal, Gloss, Subsurface Color/Amount, AO, and Height TGA maps",
+    )
+    capture_manifest_path: StringProperty(
+        name="Capture Manifest",
+        subtype="FILE_PATH",
+        default="",
+        description=(
+            "Manifest from the exact Blender map bake used by Physical Direct "
+            "Capture plan UV generation and SpeedTree handoff"
+        ),
+    )
+    capture_prefix: StringProperty(
+        name="Capture Map Prefix",
+        default="",
+        description="Filename stem shared by the eight generated maps, for example leaf_elm_01",
+    )
+    capture_resolution: IntProperty(
+        name="Capture Resolution",
+        default=2048,
+        min=1,
+        soft_min=256,
+        soft_max=8192,
+        description="Square resolution used for every generated TGA map",
+    )
+    capture_target_meters: FloatProperty(
+        name="Physical Capture Target",
+        default=0.1,
+        min=0.000001,
+        soft_min=0.01,
+        soft_max=1.0,
+        precision=4,
+        subtype="DISTANCE",
+        unit="LENGTH",
+        description=(
+            "Physical square capture side in meters; with METRIC scale_length=1.0, "
+            "0.1 meters equals 0.1 Blender Unit"
+        ),
+    )
+    capture_padding_ratio: FloatProperty(
+        name="Capture Padding",
+        default=0.04,
+        min=0.0,
+        soft_max=0.25,
+        precision=4,
+        subtype="FACTOR",
+        description="Relative world-axis capture-frame padding around the source bounds",
+    )
+    capture_plane: EnumProperty(
+        name="Capture Plane",
+        items=(
+            (
+                "XY",
+                "XY (Top)",
+                "World-axis XY capture with no roll; use for top-facing clusters.",
+            ),
+            (
+                "XZ",
+                "XZ (Front)",
+                "World-axis XZ capture with no roll; use when the cluster faces the XZ plane.",
+            ),
+            (
+                "YZ",
+                "YZ (Side, 90°)",
+                "World-axis YZ side capture with no roll; its capture basis is the explicit 90° side orientation.",
+            ),
+        ),
+        default="XY",
+        description="Explicit world-axis projection. Automatic plane selection is intentionally rejected as ambiguous.",
+    )
+    capture_last_report: StringProperty(
+        name="Last Capture Report",
+        default="",
+        description="Summary of the most recent eight-map Blender capture",
     )
     last_report: StringProperty(name="Last Report", default="")
