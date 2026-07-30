@@ -7,6 +7,12 @@ from pathlib import Path
 import addon_utils
 import bpy
 
+from .generator_delivery_contract import (
+    DELIVERY_MODE_RENDER_CONNECTED,
+    classify_generator_delivery,
+    live_export_generator_bindings,
+)
+
 
 CAMERA_REFERENCE_COLLECTION = "Atlas_Camera_Reference"
 CAMERA_CONTRACT_KEY = "speedtree_cluster_camera_uv_contract"
@@ -367,39 +373,12 @@ def _validate_adopted_material_map(
 def _generator_mesh_coverage(root, material_id):
     """Return generator Material/Mesh slots that actively use one material."""
     material_id = int(material_id)
-    slots = []
-    for generator in root.iter("Generator"):
-        properties = generator.find("Properties")
-        if properties is None:
-            continue
-        by_name = {
-            str(node.findtext("Name") or ""): node
-            for node in properties.findall("Property")
-        }
-        for name, material_node in by_name.items():
-            if not name.endswith(":Material"):
-                continue
-            prefix = name[: -len(":Material")]
-            mesh_node = by_name.get(prefix + ":Mesh")
-            if mesh_node is None:
-                continue
-            try:
-                slot_material_id = int(material_node.findtext("Value"))
-                slot_mesh_id = int(mesh_node.findtext("Value"))
-            except (TypeError, ValueError):
-                continue
-            if slot_material_id != material_id:
-                continue
-            slots.append(
-                {
-                    "generator_name": str(generator.findtext("Name") or ""),
-                    "generator_type": str(generator.attrib.get("Type") or ""),
-                    "slot_prefix": prefix,
-                    "material_id": slot_material_id,
-                    "mesh_id": slot_mesh_id,
-                }
-            )
-    return slots
+    return [
+        row
+        for row in live_export_generator_bindings(root)
+        if row["export_participates"]
+        and row["material_id"] == material_id
+    ]
 
 
 def _validate_adopted_target_spm(
@@ -529,6 +508,21 @@ def _validate_adopted_target_spm(
         raise ValueError(
             "Adopted target manifest does not prove the normalized generator-variation policy."
         )
+    generator_delivery = classify_generator_delivery(
+        spm=tree_spm,
+        connection=connection,
+        target_material_id=material_id,
+        normalized_target_mesh_ids=generated_ids,
+        live_bindings=live_export_generator_bindings(root),
+    )
+    if (
+        generator_delivery["delivery_mode"]
+        != DELIVERY_MODE_RENDER_CONNECTED
+    ):
+        raise ValueError(
+            "Adopted target Generator delivery is not render-connected: "
+            + ", ".join(generator_delivery["errors"])
+        )
     current_material = materials[0]
     original_material = decode_spm_node_snapshot(adoption["original_material_snapshot"])
     contract_material = persisted["contract"]["material"]
@@ -625,6 +619,7 @@ def _validate_adopted_target_spm(
         "adopted_material_maps": validated_maps,
         "adopted_generator_variant_policy": GENERATOR_VARIANT_POLICY,
         "adopted_generator_slots": generator_slots,
+        "generator_delivery": generator_delivery,
     }
 
 

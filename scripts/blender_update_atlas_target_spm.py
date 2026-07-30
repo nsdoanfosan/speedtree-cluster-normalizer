@@ -73,6 +73,11 @@ def main():
         GENERATOR_VARIANT_POLICY,
         _generator_mesh_coverage,
     )
+    from speedtree_cluster_normalizer.generator_delivery_contract import (
+        DELIVERY_MODE_RENDER_CONNECTED,
+        classify_generator_delivery,
+        live_export_generator_bindings,
+    )
     from atlas_leaf_mesh_builder.integration_api import configure_external_plan_target
     from atlas_leaf_mesh_builder.speedtree import (
         positive_int,
@@ -227,6 +232,21 @@ def main():
     if not manifest_path.is_file():
         raise RuntimeError("Atlas target manifest was not written")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    generator_delivery = classify_generator_delivery(
+        spm=target_spm,
+        connection=manifest.get("generator_connection"),
+        target_material_id=args.source_material_id,
+        normalized_target_mesh_ids=generated_mesh_ids,
+        live_bindings=live_export_generator_bindings(root),
+    )
+    if (
+        generator_delivery["delivery_mode"]
+        != DELIVERY_MODE_RENDER_CONNECTED
+    ):
+        raise RuntimeError(
+            "Atlas target Generator delivery is not render-connected: "
+            + ", ".join(generator_delivery["errors"])
+        )
     payload = {
         "blend": str(blend),
         "target_spm": str(target_spm),
@@ -255,6 +275,7 @@ def main():
         "plan_objects": sorted(obj.name for obj in plan_objects),
         "manifest": str(manifest_path),
         "generator_connection": manifest.get("generator_connection"),
+        "generator_delivery": generator_delivery,
         "generator_variant_policy": GENERATOR_VARIANT_POLICY,
         "generator_slots": generator_slots,
         "generator_covered_mesh_ids": sorted(covered_mesh_ids),
