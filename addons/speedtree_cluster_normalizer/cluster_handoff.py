@@ -160,7 +160,13 @@ def prepare_cluster_handoff(
         albedo_path=str(color),
         target_spm=str(target),
         source_material_id=(int(props.source_material_id or 0) or None),
-        adopt_source_material=(material_name == source_name),
+        # Same-name physical delivery refreshes existing Material_v8/Mesh
+        # assets without rewiring generators.  When a prior Atlas pass replaced
+        # the authored cluster slots with another source material, an explicit
+        # different source name restores only those live slots to the current
+        # normalized cluster outputs.
+        adopt_source_material=False,
+        connect_generators=(material_name != source_name),
         only_target=bool(props.atlas_only_target),
         mesh_geometry_scale=verified["mesh_geometry_scale"],
         mesh_asset_scale=verified["mesh_asset_scale"],
