@@ -114,7 +114,7 @@ def shared_containment_tolerance_case():
     tolerance = max(diagonal * 1.0e-7, 1.0e-9)
     if not point_in_convex_polygon((0.0, 0.0), boundary, tolerance=tolerance):
         raise RuntimeError("Synthetic root-lock tolerance did not accept the origin")
-    vertices, _uvs, _faces, attachment_index = _uniform_plan_triangulation(
+    vertices, uvs, faces, attachment_index = _uniform_plan_triangulation(
         boundary,
         boundary_uvs,
         0,
@@ -124,9 +124,16 @@ def shared_containment_tolerance_case():
     )
     if vertices[attachment_index] != (0.0, 0.0):
         raise RuntimeError("Canonical triangulation moved the attachment origin")
+    if not any(attachment_index in face for face in faces):
+        raise RuntimeError("Canonical triangulation left the attachment loose")
+    if tuple(uvs[attachment_index]) != (0.0, 0.5):
+        raise RuntimeError("Canonical triangulation did not pin the attachment UV")
     return {
         "containment_tolerance": tolerance,
         "attachment_vertex_index": attachment_index,
+        "attachment_face_count": sum(
+            attachment_index in face for face in faces
+        ),
     }
 
 
@@ -378,6 +385,10 @@ reports = {
     ),
     "forward_gap": bridged_root_lock_case(
         [(-0.4, 0.1), (0.4, 0.1), (0.6, 1.0), (-0.5, 1.0)],
+        (0.0, 1.0),
+    ),
+    "sub_tolerance_forward_gap": bridged_root_lock_case(
+        [(-0.4, 5.0e-9), (0.4, 5.0e-9), (0.6, 1.0), (-0.5, 1.0)],
         (0.0, 1.0),
     ),
     "shared_containment_tolerance": shared_containment_tolerance_case(),
