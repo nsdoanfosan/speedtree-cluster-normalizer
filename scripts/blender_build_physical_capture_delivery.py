@@ -30,6 +30,8 @@ def parse_args():
     parser.add_argument("--plan-collection", required=True)
     parser.add_argument("--material", required=True)
     parser.add_argument("--material-id", required=True, type=int)
+    parser.add_argument("--source-material")
+    parser.add_argument("--source-material-id", type=int)
     parser.add_argument("--capture-output-dir")
     parser.add_argument("--capture-prefix")
     parser.add_argument("--capture-resolution", type=int, default=1024)
@@ -170,8 +172,12 @@ def main():
     props.skeletal_base_name = args.skeletal_base
     props.plan_collection = args.plan_collection
     props.plan_material_name = args.material
-    props.source_material_name = args.material
-    props.source_material_id = args.material_id
+    props.source_material_name = args.source_material or args.material
+    props.source_material_id = (
+        args.source_material_id
+        if args.source_material_id is not None
+        else args.material_id
+    )
     props.plan_margin_ratio = args.plan_margin_ratio
     props.plan_refinement_levels = args.plan_refinement_levels
     props.replace_generated = True
@@ -202,7 +208,10 @@ def main():
         )
         props.atlas_albedo_path = str(capture_output / f"{args.capture_prefix}.tga")
         props.atlas_target_spm = str(target_spm)
-        props.atlas_only_target = True
+        # Publish this invocation to one exact target, but keep every peer
+        # target registered to the shared provider.  Clearing the persistent
+        # registry here made the next tree re-extract the same cluster.
+        props.atlas_only_target = False
         props.unit_probe_contract_path = str(unit_probe)
         target_before = fingerprint(target_spm)
 
@@ -263,26 +272,48 @@ def main():
             raise RuntimeError(f"Plan UV is not direct capture UV: {row['plan']}")
     identity_object_names(object_names)
 
-    atlas_result = None
+    # Persist the normalized provider before Atlas fingerprints it.  Saving
+    # after target publication changes the blend hash immediately and makes a
+    # successful source-refresh receipt look stale, which used to trigger the
+    # same expensive capture/normalization again on the next consumer.
+    save_to.parent.mkdir(parents=True, exist_ok=True)
+    bpy.ops.wm.save_as_mainfile(filepath=str(save_to), check_existing=False)
+    if Path(bpy.data.filepath).resolve() != save_to:
+        raise RuntimeError("Blender did not save the requested output blend")
+
+    atlas_operator_result = None
+    atlas_transaction = None
     atlas_manifest = None
     if production:
-        handoff = build.get("atlas_handoff") or {}
+        # PHYSICAL_DIRECT_CAPTURE is published through the current Cluster
+        # handoff adapter. ``atlas_handoff`` is the legacy camera-UV key and
+        # is intentionally absent from physical build reports.
+        handoff = build.get("cluster_handoff") or {}
         if not handoff.get("prepared"):
-            raise RuntimeError(f"Atlas handoff was not prepared: {handoff}")
-        atlas_result = bpy.ops.atlas_leaf.build_speedtree_spm()
-        if set(atlas_result) != {"FINISHED"}:
-            raise RuntimeError(f"Atlas SPM build did not finish: {sorted(atlas_result)}")
+            raise RuntimeError(f"Cluster handoff was not prepared: {handoff}")
+        from atlas_leaf_mesh_builder.integration_api import (
+            execute_external_target_transaction,
+        )
+
+        # Cluster delivery preserves an explicit M_cluster_* material identity.
+        # The regular UI operator intentionally canonicalizes new outputs to
+        # M_leaf_*, so external delivery must use Atlas' exact-target API.
+        atlas_transaction = execute_external_target_transaction(
+            scene.atlas_leaf_builder,
+            [target_spm],
+            preserve_explicit_material_name=True,
+        )
+        if (atlas_transaction.get("transaction") or {}).get("status") != "committed":
+            raise RuntimeError(
+                f"Atlas SPM transaction did not commit: {atlas_transaction}"
+            )
+        atlas_operator_result = ["FINISHED"]
         atlas_manifest = (
             target_spm.parent
             / ".atlas_leaf_speedtree_targets"
             / f"{target_spm.stem}.json"
         )
         atlas_manifest = required_file(atlas_manifest, "Atlas target manifest")
-
-    save_to.parent.mkdir(parents=True, exist_ok=True)
-    bpy.ops.wm.save_as_mainfile(filepath=str(save_to), check_existing=False)
-    if Path(bpy.data.filepath).resolve() != save_to:
-        raise RuntimeError("Blender did not save the requested output blend")
 
     payload = {
         "kind": "speedtree_cluster_physical_capture_delivery",
@@ -311,9 +342,8 @@ def main():
         "target_spm_after": (
             fingerprint(target_spm) if target_spm is not None else None
         ),
-        "atlas_operator_result": (
-            sorted(atlas_result) if atlas_result is not None else None
-        ),
+        "atlas_operator_result": atlas_operator_result,
+        "atlas_transaction": atlas_transaction,
         "atlas_manifest": (
             fingerprint(atlas_manifest) if atlas_manifest is not None else None
         ),
@@ -322,7 +352,7 @@ def main():
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
     print("STCLUSTER_PHYSICAL_DELIVERY=" + str(report_path))
