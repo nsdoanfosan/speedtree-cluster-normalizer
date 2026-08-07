@@ -952,10 +952,16 @@ def root_locked_expanded_hull(points, margin_ratio, root_axis):
     ]
     diagonal = math.hypot(*spans)
     tolerance = max(diagonal * 1.0e-7, 1.0e-9)
+    # Containment decides whether the authored attachment must become part of
+    # the plan hull.  A broad tolerance here can classify a point just outside
+    # the source silhouette as inside, leaving the subsequently-added origin
+    # as a loose CDT vertex that FBX drops.  Use exact half-plane signs for the
+    # classification; the scale-aware tolerance is still used by the later
+    # validation and ray-intersection guards.
     attachment_inside = point_in_convex_polygon(
         attachment,
         base_hull,
-        tolerance=tolerance,
+        tolerance=0.0,
     )
     ray_hits = []
     if not attachment_inside:
@@ -1925,6 +1931,37 @@ def _uniform_plan_triangulation(
     ):
         raise ValueError("Plan boundary does not contain its normalized attachment origin.")
 
+    # If the attachment is only accepted by the shared scale-aware tolerance,
+    # make it an explicit constrained boundary vertex.  Passing it merely as a
+    # free CDT point can leave it unreferenced by every face; Blender then has
+    # no loop UV for the vertex and FBX legitimately removes it.
+    if not point_in_convex_polygon(
+        attachment_point,
+        boundary_points,
+        tolerance=0.0,
+    ):
+        attachment_vector = Vector(attachment_point)
+        nearest_edge = min(
+            (
+                _point_segment_parameter(
+                    attachment_vector,
+                    Vector(boundary_points[index]),
+                    Vector(boundary_points[(index + 1) % len(boundary_points)]),
+                )[1],
+                index,
+            )
+            for index in range(len(boundary_points))
+        )
+        if nearest_edge[0] > containment_tolerance:
+            raise ValueError(
+                "Plan attachment is outside the boundary beyond its "
+                "containment tolerance."
+            )
+        insert_at = nearest_edge[1] + 1
+        boundary_points.insert(insert_at, attachment_point)
+        uvs.insert(insert_at, attachment_uv)
+        points = list(boundary_points)
+
     if levels > 0:
         target_triangles = min(
             128,
@@ -2006,7 +2043,7 @@ def _uniform_plan_triangulation(
     if input_attachment_index is None:
         points.append(attachment_point)
 
-    boundary_count = len(boundary)
+    boundary_count = len(boundary_points)
     edges = [
         (index, (index + 1) % boundary_count)
         for index in range(boundary_count)
@@ -2024,7 +2061,7 @@ def _uniform_plan_triangulation(
         raise ValueError("Constrained plan triangulation did not return triangles.")
     tolerance = diagonal * 1.0e-8
     result_uvs = [
-        _mean_value_boundary_uv(vertex, boundary, boundary_uvs, tolerance)
+        _mean_value_boundary_uv(vertex, boundary_points, uvs, tolerance)
         for vertex in cdt_vertices
     ]
     attachment_vertex_index = min(
@@ -2033,6 +2070,11 @@ def _uniform_plan_triangulation(
     )
     if math.dist(tuple(cdt_vertices[attachment_vertex_index]), attachment_point) > tolerance:
         raise ValueError("CDT did not preserve the normalized attachment origin.")
+    if not any(
+        attachment_vertex_index in face
+        for face in faces
+    ):
+        raise ValueError("CDT left the normalized attachment origin unreferenced.")
     cdt_vertices[attachment_vertex_index] = Vector(attachment_point)
     result_uvs[attachment_vertex_index] = attachment_uv
     return (
