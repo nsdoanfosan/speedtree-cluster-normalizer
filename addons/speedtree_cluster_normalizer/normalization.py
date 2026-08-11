@@ -952,16 +952,18 @@ def root_locked_expanded_hull(points, margin_ratio, root_axis):
     ]
     diagonal = math.hypot(*spans)
     tolerance = max(diagonal * 1.0e-7, 1.0e-9)
-    # Containment decides whether the authored attachment must become part of
-    # the plan hull.  A broad tolerance here can classify a point just outside
-    # the source silhouette as inside, leaving the subsequently-added origin
-    # as a loose CDT vertex that FBX drops.  Use exact half-plane signs for the
-    # classification; the scale-aware tolerance is still used by the later
-    # validation and ray-intersection guards.
+    # Classify containment with the same scale-aware tolerance used by delivery
+    # validation.  The triangulation path below explicitly inserts an attachment
+    # that is only tolerance-contained as a constrained boundary vertex, so it
+    # can no longer remain a loose CDT point that FBX drops.  Treating that same
+    # near-boundary point as a forward gap is internally inconsistent: delivery
+    # validation rejects bridge entries that do not exceed this tolerance, and
+    # tangent silhouettes can also legitimately retain projection support just
+    # behind the authored attachment.
     attachment_inside = point_in_convex_polygon(
         attachment,
         base_hull,
-        tolerance=0.0,
+        tolerance=tolerance,
     )
     ray_hits = []
     if not attachment_inside:
