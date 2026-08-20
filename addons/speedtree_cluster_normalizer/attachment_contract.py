@@ -14,6 +14,10 @@ from mathutils import Vector
 
 XML_ATTR_RE = re.compile(r'([A-Za-z][A-Za-z0-9]*)="([^"]*)"')
 XML_SOURCE_RE = re.compile(r'<SpeedTreeRaw\b[^>]*\bSource="([^"]+)"')
+SPEEDTREE_AXIS_BONE_RE = re.compile(
+    r"^Bone_(\d+)_(Start|End)$",
+    flags=re.IGNORECASE,
+)
 XML_SCALE_CANDIDATES = (100.0, 1.0, 3.28084, 30.48, 0.01)
 GEOMETRY_SUPPORTED_ATTACHMENT_POLICY = "geometry_supported_xml_root_segment"
 SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION = 1
@@ -300,25 +304,63 @@ def _median(values):
 
 
 def _choose_xml_scale(bones, armature):
-    heads = [armature.matrix_world @ bone.head_local for bone in armature.data.bones]
-    if not heads:
+    bones_by_id = {int(bone["id"]): bone for bone in bones}
+    named_markers = []
+    for bone in armature.data.bones:
+        match = SPEEDTREE_AXIS_BONE_RE.fullmatch(str(bone.name))
+        if match is None:
+            continue
+        ordinal = int(match.group(1))
+        if ordinal <= 0:
+            raise ValueError(
+                f"Source armature has invalid SpeedTree bone ordinal: {bone.name}"
+            )
+        xml_id = ordinal - 1
+        xml_bone = bones_by_id.get(xml_id)
+        if xml_bone is None:
+            raise ValueError(
+                "Source FBX bone name references an XML Bone ID that does not "
+                f"exist: {bone.name} -> {xml_id}"
+            )
+        named_markers.append(
+            {
+                "world": armature.matrix_world @ bone.head_local,
+                "xml_bone": xml_bone,
+                "role": match.group(2).casefold(),
+            }
+        )
+    if not named_markers:
         raise ValueError("Source armature has no joints for XML scale validation.")
     scores = []
     for scale in XML_SCALE_CANDIDATES:
-        endpoints = [
-            point / scale
-            for bone in bones
-            for point in (bone["start_raw"], bone["end_raw"])
+        distances = [
+            float(
+                (
+                    marker["world"]
+                    - marker["xml_bone"][
+                        "start_raw"
+                        if marker["role"] == "start"
+                        else "end_raw"
+                    ]
+                    / scale
+                ).length
+            )
+            for marker in named_markers
         ]
-        distances = [min((head - point).length for point in endpoints) for head in heads]
         scores.append(
             {
                 "scale": float(scale),
-                "median_nearest": float(_median(distances)),
-                "max_nearest": float(max(distances)),
+                "median_named_error": float(_median(distances)),
+                "max_named_error": float(max(distances)),
             }
         )
-    scores.sort(key=lambda row: (row["median_nearest"], row["max_nearest"], row["scale"]))
+    scores.sort(
+        key=lambda row: (
+            row["median_named_error"],
+            row["max_named_error"],
+            row["scale"],
+        )
+    )
     return scores[0]["scale"], scores
 
 
@@ -421,44 +463,44 @@ def match_root_attachment(
     name = representative_bone.name
     head = _bone_world_head(armature, representative_bone)
     endpoint = _bone_world_head(armature, endpoint_bone) if endpoint_bone else None
-    roots = [bone for bone in contract["roots"] if bone["id"] not in used_root_ids]
-    if not roots:
-        raise ValueError(f"No unused XML structural root remains for {name}.")
-    lowered = name.casefold()
-    candidates = []
-    if lowered.endswith("_start"):
-        for root in roots:
-            start_error = float((head - root["start_world"]).length)
-            end_error = (
-                float((endpoint - root["end_world"]).length)
-                if endpoint is not None
-                else 0.0
-            )
-            candidates.append((start_error + end_error, start_error, end_error, root))
-        policy = "xml_root_start_to_start_joint"
-    elif lowered.endswith("_end") and representative_bone.parent is None:
-        for root in roots:
-            end_error = float((head - root["end_world"]).length)
-            candidates.append((end_error, 0.0, end_error, root))
-        policy = "xml_root_end_identifies_missing_start_joint"
+    match = SPEEDTREE_AXIS_BONE_RE.fullmatch(str(name))
+    if match is None or int(match.group(1)) <= 0:
+        raise ValueError(
+            f"Prototype representative '{name}' has no exact Bone_N_Start/End identity."
+        )
+    xml_id = int(match.group(1)) - 1
+    root = next(
+        (bone for bone in contract["roots"] if int(bone["id"]) == xml_id),
+        None,
+    )
+    if root is None:
+        raise ValueError(
+            f"Prototype representative '{name}' references missing XML "
+            f"structural root ID {xml_id}."
+        )
+    if xml_id in used_root_ids:
+        raise ValueError(
+            f"XML structural root ID {xml_id} is referenced more than once: {name}."
+        )
+    role = match.group(2).casefold()
+    if role == "start":
+        start_error = float((head - root["start_world"]).length)
+        end_error = (
+            float((endpoint - root["end_world"]).length)
+            if endpoint is not None
+            else 0.0
+        )
+        policy = "exact_bone_ordinal_to_xml_root_id_start_v1"
+    elif role == "end" and representative_bone.parent is None:
+        start_error = 0.0
+        end_error = float((head - root["end_world"]).length)
+        policy = "exact_bone_ordinal_to_xml_root_id_orphan_end_v1"
     else:
         raise ValueError(
             f"Prototype representative '{name}' is not an XML structural Start root "
             "or an orphan End with a missing Start joint."
         )
-    candidates.sort(key=lambda row: (row[0], row[3]["id"]))
-    best = candidates[0]
     tolerance = max(float(geometry_scale) * 1.0e-4, 1.0e-6)
-    if best[1] > tolerance or best[2] > tolerance:
-        raise ValueError(
-            f"XML root match for '{name}' exceeds relative tolerance: "
-            f"start={best[1]:.9g}, end={best[2]:.9g}, tolerance={tolerance:.9g}."
-        )
-    if len(candidates) > 1 and math.isclose(
-        candidates[1][0], best[0], rel_tol=0.0, abs_tol=tolerance * 1.0e-3
-    ):
-        raise ValueError(f"XML structural root match is ambiguous for '{name}'.")
-    root = best[3]
     used_root_ids.add(root["id"])
     direction = root["end_world"] - root["start_world"]
     if direction.length <= tolerance:
@@ -473,9 +515,15 @@ def match_root_attachment(
         "representative_bone": name,
         "endpoint_bone": endpoint_bone.name if endpoint_bone else "",
         "match_policy": policy,
-        "start_match_error": float(best[1]),
-        "end_match_error": float(best[2]),
+        "identity_contract": "fbx_named_roots_subset_of_xml_roots_v1",
+        "start_match_error": float(start_error),
+        "end_match_error": float(end_error),
         "match_tolerance": float(tolerance),
+        "coordinate_validation": (
+            "within_tolerance"
+            if start_error <= tolerance and end_error <= tolerance
+            else "diagnostic_mismatch"
+        ),
     }
 
 

@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import tempfile
@@ -222,6 +223,54 @@ with tempfile.TemporaryDirectory(prefix="stcluster_xml_") as directory:
     )
     if Vector(start_match["xml_start_world"]) != Vector((1.0, 2.0, 3.0)):
         raise RuntimeError("Start joint did not resolve the XML physical root")
+    subset_contract = copy.deepcopy(contract)
+    subset_contract["roots"][0]["start_world"] = Vector((8.0, 8.0, 8.0))
+    subset_contract["roots"][0]["end_world"] = Vector((8.0, 9.0, 8.0))
+    subset_contract["roots"].append(
+        {
+            **copy.deepcopy(contract["roots"][0]),
+            "id": 1,
+            "start_world": Vector((1.0, 2.0, 3.0)),
+            "end_world": Vector((1.0, 4.0, 3.0)),
+            "generator": "CloserButWrongIdentity",
+        }
+    )
+    subset_match = match_root_attachment(
+        subset_contract,
+        start_armature,
+        start_bone,
+        endpoint_bone,
+        10.0,
+        set(),
+    )
+    if (
+        subset_match["xml_bone_id"] != 0
+        or subset_match["match_policy"]
+        != "exact_bone_ordinal_to_xml_root_id_start_v1"
+        or subset_match["coordinate_validation"] != "diagnostic_mismatch"
+    ):
+        raise RuntimeError(
+            "Bone_1_Start did not remain locked to XML ID 0 when a closer "
+            "unused XML root was present"
+        )
+    missing_identity_contract = copy.deepcopy(contract)
+    missing_identity_contract["roots"][0]["id"] = 1
+    try:
+        match_root_attachment(
+            missing_identity_contract,
+            start_armature,
+            start_bone,
+            endpoint_bone,
+            10.0,
+            set(),
+        )
+    except ValueError as exc:
+        if "missing XML structural root ID 0" not in str(exc):
+            raise
+    else:
+        raise RuntimeError(
+            "A missing named XML root was replaced by a spatial fallback"
+        )
     start_only_armature = build_armature(
         "SyntheticStartOnlyArmature",
         start_only=True,
@@ -337,7 +386,7 @@ with tempfile.TemporaryDirectory(prefix="stcluster_xml_") as directory:
     )
     if (
         orphan_match["match_policy"]
-        != "xml_root_end_identifies_missing_start_joint"
+        != "exact_bone_ordinal_to_xml_root_id_orphan_end_v1"
         or Vector(orphan_match["xml_start_world"]) != Vector((1.0, 2.0, 3.0))
     ):
         raise RuntimeError("Orphan End did not recover the XML segment Start")

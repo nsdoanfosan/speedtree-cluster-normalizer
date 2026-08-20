@@ -2721,8 +2721,14 @@ def build_normalized_cluster_assets(
         camera_contract = camera_uv_bundle["contract"].get("camera") or {}
         _camera_world_axes(camera_contract)
     else:
+        referenced_root_ids = {
+            _explicit_start_bone_ordinal(bone.name) - 1
+            for bone in bones
+        }
         reference_planes = [
-            None for _root in attachment_contract.get("roots") or []
+            None
+            for root in attachment_contract.get("roots") or []
+            if int(root["id"]) in referenced_root_ids
         ]
         if not reference_planes:
             raise ValueError(
@@ -2759,10 +2765,11 @@ def build_normalized_cluster_assets(
             (_explicit_start_bone_ordinal(bone.name), bone) for bone in bones
         ]
         ordinals = [row[0] for row in valid_per_deform_rows]
-        expected_ordinals = list(range(1, len(valid_per_deform_rows) + 1))
-        if len(set(ordinals)) != len(ordinals) or sorted(ordinals) != expected_ordinals:
+        if len(set(ordinals)) != len(ordinals) or any(
+            ordinal <= 0 for ordinal in ordinals
+        ):
             raise ValueError(
-                "Populated *_N_Start bone ordinals must be unique and consecutive 1..N; "
+                "Populated *_N_Start bone ordinals must be unique and positive; "
                 f"found {sorted(ordinals)}."
             )
         for _ordinal, bone in valid_per_deform_rows:
