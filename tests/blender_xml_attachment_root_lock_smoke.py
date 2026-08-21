@@ -98,6 +98,35 @@ def bridged_root_lock_case(points, axis):
     return report
 
 
+def tolerance_tangent_root_lock_case():
+    points = [
+        (-1.0, -1.0),
+        (1.0, 1.0 + 2.0e-9),
+        (0.0, 2.0),
+    ]
+    base = convex_hull_2d(points)
+    spans = [
+        max(point[index] for point in base)
+        - min(point[index] for point in base)
+        for index in range(2)
+    ]
+    tolerance = max((spans[0] ** 2 + spans[1] ** 2) ** 0.5 * 1.0e-7, 1.0e-9)
+    if point_in_convex_polygon((0.0, 0.0), base, tolerance=0.0):
+        raise RuntimeError("Synthetic tangent origin is not exact-outside")
+    if not point_in_convex_polygon((0.0, 0.0), base, tolerance=tolerance):
+        raise RuntimeError("Synthetic tangent origin is not tolerance-contained")
+    hull, report = root_locked_expanded_hull(points, 0.2, (0.0, 1.0))
+    if report["policy"] != "xml_root_tangent_preserve_unexpanded_projection_support":
+        raise RuntimeError("Sub-tolerance tangent incorrectly used the bridge contract")
+    if report["attachment_inside_unexpanded_projection"] is not True:
+        raise RuntimeError("Sub-tolerance tangent was reported outside source geometry")
+    if report["unexpanded_root_support"] >= -tolerance:
+        raise RuntimeError("Synthetic tangent did not retain rear projection support")
+    if not point_in_convex_polygon((0.0, 0.0), hull, tolerance=tolerance):
+        raise RuntimeError("Root-locked tangent lost its attachment origin")
+    return report
+
+
 def shared_containment_tolerance_case():
     boundary = [
         (5.0e-9, -1.0),
@@ -436,10 +465,7 @@ reports = {
         [(-0.4, 0.1), (0.4, 0.1), (0.6, 1.0), (-0.5, 1.0)],
         (0.0, 1.0),
     ),
-    "sub_tolerance_forward_gap": bridged_root_lock_case(
-        [(-0.4, 5.0e-9), (0.4, 5.0e-9), (0.6, 1.0), (-0.5, 1.0)],
-        (0.0, 1.0),
-    ),
+    "sub_tolerance_tangent": tolerance_tangent_root_lock_case(),
     "shared_containment_tolerance": shared_containment_tolerance_case(),
 }
 try:

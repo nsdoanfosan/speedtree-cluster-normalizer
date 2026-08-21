@@ -16,10 +16,14 @@ def main():
     bpy.context.view_layer.objects.active = armature
     armature.select_set(True)
     bpy.ops.object.mode_set(mode="EDIT")
+    root = armature_data.edit_bones.new("Root")
+    root.head = (0.0, 0.0, 0.0)
+    root.tail = (0.0, 0.5, 0.0)
     for index in range(1, 13):
         start = armature_data.edit_bones.new(f"Bone_{index}_Start")
         start.head = (0.0, float(index), 0.0)
         start.tail = (0.0, float(index) + 0.25, 0.0)
+        start.parent = root
         end = armature_data.edit_bones.new(f"Bone_{index}_End")
         end.head = (0.0, float(index) + 1.0, 0.0)
         end.tail = (0.0, float(index) + 1.25, 0.0)
@@ -61,25 +65,29 @@ def main():
     modifier = source.modifiers.new("Armature", "ARMATURE")
     modifier.object = armature
 
+    native_root = source.vertex_groups.new(name="Root")
+    native_root.add(range(len(vertices)), 0.75, "REPLACE")
     shared = source.vertex_groups.new(name="Bone_1_Start")
-    shared.add([0], 1.0, "REPLACE")
+    shared.add([0], 0.25, "REPLACE")
     for index, indices in face_vertices:
         group = source.vertex_groups.get(f"Bone_{index}_Start")
         if group is None:
             group = source.vertex_groups.new(name=f"Bone_{index}_Start")
-        group.add(indices, 1.0, "REPLACE")
+        group.add(indices, 0.25, "REPLACE")
 
     weights = normalization._vertex_bone_weights(source, armature)
-    assignments = normalization._face_group_assignments(source, weights)
-    populated = {name for name, values in assignments["faces"].items() if values}
-    rows = sorted(
-        (
-            normalization._explicit_start_bone_ordinal(bone.name),
-            bone,
-        )
-        for bone in armature.data.bones
-        if bone.name in populated
-    )
+    native_assignments = normalization._face_group_assignments(source, weights)
+    if set(native_assignments["faces"]) != {"Root"}:
+        raise RuntimeError("Fixture did not reproduce the native shared Root dominance")
+    rows = normalization._speedtree_prototype_bone_rows(armature.data.bones)
+    prototype_names = {bone.name for _ordinal, bone in rows}
+    prototype_weights = {
+        vertex_index: {
+            name: weight for name, weight in row.items() if name in prototype_names
+        }
+        for vertex_index, row in weights.items()
+    }
+    assignments = normalization._face_group_assignments(source, prototype_weights)
     groups = normalization._connected_deform_clusters(source, assignments, rows)
     actual = [group["bone_names"] for group in groups]
     expected = [
