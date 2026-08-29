@@ -322,22 +322,27 @@ def _preferred_endpoint_bone(bone, populated_bones):
         return None, "start_bone_tail_axis_endpoint"
     if bone.name.casefold().endswith("_end") and bone.parent is None:
         return None, "orphan_end_uses_validated_asset_root_pivot"
-    raise ValueError(
-        f"Populated deform bone '{bone.name}' must be a *_Start axis bone or an "
-        "orphan root *_End handled by a validated asset pivot."
-    )
+    return None, "native_bone_tail_axis_endpoint"
 
 
-def _explicit_start_bone_ordinal(bone_name):
-    match = re.search(r"_(\d+)_(?:Start|End)$", str(bone_name), flags=re.IGNORECASE)
-    if match is None:
-        raise ValueError(
-            f"Populated deform bone '{bone_name}' needs an explicit *_N_Start or orphan *_N_End ordinal."
+def _speedtree_prototype_bone_rows(bones):
+    """Return exact FBX prototype axes without treating the shared Root as one."""
+    rows = []
+    for bone in bones:
+        match = re.search(
+            r"_(\d+)_(Start|End)$",
+            str(bone.name),
+            flags=re.IGNORECASE,
         )
-    ordinal = int(match.group(1))
-    if ordinal < 1:
-        raise ValueError(f"Bone ordinal must be greater than zero: {bone_name}")
-    return ordinal
+        if match is None:
+            continue
+        ordinal = int(match.group(1))
+        role = match.group(2).casefold()
+        if ordinal < 1 or (role == "end" and bone.parent is not None):
+            continue
+        rows.append((ordinal, bone))
+    rows.sort(key=lambda row: (row[0], _natural_key(row[1].name)))
+    return rows
 
 
 def _stable_perpendicular(axis, armature):
@@ -2709,11 +2714,22 @@ def build_normalized_cluster_assets(
     source_3d_contract = serialized_contract_source(attachment_contract)
     used_xml_root_ids = set()
     weights = _vertex_bone_weights(source, armature)
-    assignments = _face_group_assignments(source, weights)
+    native_assignments = _face_group_assignments(source, weights)
     populated = {
-        name for name, faces in assignments["faces"].items() if faces
+        name for name, faces in native_assignments["faces"].items() if faces
     }
     bones = [bone for bone in armature.data.bones if bone.name in populated]
+    valid_per_deform_rows = _speedtree_prototype_bone_rows(bones)
+    prototype_bone_names = {bone.name for _ordinal, bone in valid_per_deform_rows}
+    prototype_weights = {
+        vertex_index: {
+            name: weight
+            for name, weight in row.items()
+            if name in prototype_bone_names
+        }
+        for vertex_index, row in weights.items()
+    }
+    assignments = _face_group_assignments(source, prototype_weights)
     if workflow_mode == WORKFLOW_LEGACY_CAMERA_UV:
         reference_planes = camera_uv_bundle["contract"].get("planes") or []
         if not reference_planes:
@@ -2721,10 +2737,7 @@ def build_normalized_cluster_assets(
         camera_contract = camera_uv_bundle["contract"].get("camera") or {}
         _camera_world_axes(camera_contract)
     else:
-        referenced_root_ids = {
-            _explicit_start_bone_ordinal(bone.name) - 1
-            for bone in bones
-        }
+        referenced_root_ids = {ordinal - 1 for ordinal, _bone in valid_per_deform_rows}
         reference_planes = [
             None
             for root in attachment_contract.get("roots") or []
@@ -2752,32 +2765,15 @@ def build_normalized_cluster_assets(
             camera_contract,
         )
 
-    valid_per_deform_rows = []
     per_deform_error = None
-    try:
-        if not populated:
-            raise ValueError("Source has no populated armature deform groups.")
-        if assignments["unweighted_faces"]:
-            raise ValueError(
-                f"Source has {len(assignments['unweighted_faces'])} faces without deform weights."
-            )
-        valid_per_deform_rows = [
-            (_explicit_start_bone_ordinal(bone.name), bone) for bone in bones
-        ]
-        ordinals = [row[0] for row in valid_per_deform_rows]
-        if len(set(ordinals)) != len(ordinals) or any(
-            ordinal <= 0 for ordinal in ordinals
-        ):
-            raise ValueError(
-                "Populated *_N_Start bone ordinals must be unique and positive; "
-                f"found {sorted(ordinals)}."
-            )
-        for _ordinal, bone in valid_per_deform_rows:
-            _preferred_endpoint_bone(bone, populated)
-        valid_per_deform_rows.sort(key=lambda row: row[0])
-    except ValueError as exc:
+    if not valid_per_deform_rows:
+        per_deform_error = "Source has no populated SpeedTree prototype axis groups."
+    elif assignments["unweighted_faces"]:
+        per_deform_error = (
+            f"Source has {len(assignments['unweighted_faces'])} faces without an exact "
+            "SpeedTree prototype relationship."
+        )
         valid_per_deform_rows = []
-        per_deform_error = str(exc)
 
     resolved_partition_mode = source_partition_mode
     whole_pivot = None
