@@ -105,12 +105,12 @@ scripts/
 ## Validation
 
 ```powershell
-& 'C:\Program Files\Blender Foundation\Blender 5.1\blender.exe' --factory-startup --background --python 'tests\blender_cluster_normalization_smoke.py' -- --output 'cluster_smoke.json'
+& 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' --factory-startup --background --python 'tests\blender_cluster_normalization_smoke.py' -- --output 'cluster_smoke.json'
 ```
 
 The real Atlas handoff smoke test mutates the SPM passed with `--target-spm`, so it must receive an isolated copy. To add an explicit production-file guard without embedding a workstation-specific path in the repository, set `SPEEDTREE_CLUSTER_PRODUCTION_SPM` or pass `--production-spm`. Existing calls that already supply the required smoke-test arguments continue to work unchanged.
 
 ```powershell
 $env:SPEEDTREE_CLUSTER_PRODUCTION_SPM = 'D:\path\to\production_tree.spm'
-& 'C:\Program Files\Blender Foundation\Blender 5.1\blender.exe' --factory-startup --background --python 'tests\blender_atlas_spm_handoff_smoke.py' -- --normalized-blend 'normalized.blend' --target-spm 'test_outputs\isolated_tree.spm' --albedo 'atlas_color.png' --report 'test_outputs\atlas_handoff.json'
+& 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' --factory-startup --background --python 'tests\blender_atlas_spm_handoff_smoke.py' -- --normalized-blend 'normalized.blend' --target-spm 'test_outputs\isolated_tree.spm' --albedo 'atlas_color.png' --report 'test_outputs\atlas_handoff.json'
 ```
