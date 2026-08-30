@@ -114,10 +114,9 @@ def main():
         args.capture_target_meters
     ):
         raise RuntimeError("Physical capture target must be finite and positive")
-    if args.role == "leaf_side" and args.capture_plane != "YZ":
-        raise RuntimeError("Leaf Side production requires the explicit YZ 90-degree capture")
-    if args.role != "leaf_side" and args.capture_plane != "XY":
-        raise RuntimeError("Branch/Leaf production requires the XY front capture")
+    # Role is delivery metadata; capture orientation is an independent,
+    # explicit world-axis choice.  In particular, branch-side assets must be
+    # allowed to request YZ instead of being forced back to the XY top view.
 
     production = args.mode == "production"
     capture_output = None
