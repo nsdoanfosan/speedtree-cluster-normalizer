@@ -20,6 +20,10 @@ from .attachment_contract import (
     serialized_attachment,
     serialized_contract_source,
 )
+from .part_bend_payload import (
+    resolve_part_bend_role,
+    write_normalized_part_bend_payload,
+)
 
 
 GENERATED_FLAG = "speedtree_cluster_generated"
@@ -2609,11 +2613,13 @@ def build_normalized_cluster_assets(
     source_xml_path="",
     workflow_mode=WORKFLOW_LEGACY_CAMERA_UV,
     physical_capture_contract=None,
+    part_bend_role="AUTO",
 ):
     if context.mode != "OBJECT":
         raise ValueError("Cluster normalization must start in Object Mode.")
     plan_base_name = plan_base_name.strip().rstrip("_")
     skeletal_base_name = skeletal_base_name.strip().rstrip("_")
+    resolved_part_bend_role = resolve_part_bend_role(skeletal_base_name, part_bend_role)
     plan_collection_name = plan_collection_name.strip()
     plan_material_name = plan_material_name.strip()
     source_reference_collection_name = source_reference_collection_name.strip()
@@ -3221,6 +3227,11 @@ def build_normalized_cluster_assets(
                 card_names[0],
                 journal,
             )
+            part_bend_payload = (
+                write_normalized_part_bend_payload(part, resolved_part_bend_role)
+                if resolved_part_bend_role is not None
+                else None
+            )
             for obj in (pivot, part_armature, part):
                 obj[PROTOTYPE_INDEX_KEY] = int(prototype["index"])
                 obj[PROTOTYPE_ASSET_KEY] = prototype["asset_name"]
@@ -3262,6 +3273,7 @@ def build_normalized_cluster_assets(
                     "endpoint_policy": prototype["endpoint_policy"],
                     "face_count": len(part.data.polygons),
                     "vertex_count": len(part.data.vertices),
+                    "part_bend_payload": part_bend_payload,
                     "frame_world": _matrix_rows(prototype["frame"]["matrix_world"]),
                     "source_frame_world": (
                         _matrix_rows(prototype["frame"]["source_frame_world"])
@@ -3452,6 +3464,10 @@ def build_normalized_cluster_assets(
                         material.name if material else None for material in part.data.materials
                     ],
                     "uv_layers": [layer.name for layer in part.data.uv_layers],
+                    "part_bend_payload": next(
+                        row["part_bend_payload"] for row in prototype_reports
+                        if row["prototype_index"] == card["prototype_index"]
+                    ),
                     "color_attributes": [attribute.name for attribute in part.data.color_attributes],
                 }
             )
@@ -3466,6 +3482,7 @@ def build_normalized_cluster_assets(
             "source_armature": armature.name,
             "source_3d_contract": source_3d_contract,
             "source_preserved": True,
+            "part_bend_role": resolved_part_bend_role,
             "variant_count": len(records),
             "card_count": len(records),
             "prototype_count": len(prototype_reports),

@@ -16,6 +16,7 @@ import bpy
 
 _SUBMODULE_NAMES = (
     "attachment_contract",
+    "part_bend_payload",
     "normalization",
     "capture_bake",
     "unit_contract",

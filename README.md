@@ -9,6 +9,7 @@ This add-on owns only:
 - deform-group part detection,
 - validated attachment-origin normalization with preserved `Start`/`End` lineage,
 - origin-safe 3D part and plan construction,
+- persistent root-to-tip Nanite bend weights on normalized 3D leaf parts,
 - exact camera-SPM cutout contract validation and boundary UV transfer,
 - Send to Unreal hierarchy preparation,
 - configuration handoff to the existing Atlas add-on.
@@ -56,6 +57,10 @@ Export
 ```
 
 The top Empty supplies the asset name through Send to Unreal's `Use Immediate Parent Name`. The mesh geometry, part armature, and root bone are already normalized; the Empty is not treated as a substitute for transform normalization.
+
+With the default `AUTO` policy, normalized Elm `SK_leaf_elm_*` prototypes receive UV3 `nanite_part_bend`; names with a separate `side` token use the side role. Other species and families, including branch, keep their UV layout. The original UV0/UV1/UV2, vertex colors, geometry, weights, and active/render/clone UV choices are preserved. A missing third channel or occupied UV3 stops the build instead of replacing existing data. The optional `part_bend_role` argument accepts `AUTO`, `leaf`, `leaf_side`, or `NONE`; explicit roles remain available for a separately authorized rollout.
+
+The weight is `clamp(localY / maxLocalY, 0, 1)` after normalization, so the attachment origin stays at weight zero even if the mesh bounds extend slightly behind it. Blender stores `UV3=(8+weight, 1-role)`, with role `1` for leaf and `2` for side; the skeletal FBX import's V flip produces Unreal `(8+weight, role)`. UV0 texture coordinates are not used for this mask. The generated mesh and object record the encoding and bounds under `speedtree_cluster_part_bend_payload`, and normalization receipts include the same payload. Saved normalized 3D Export objects can be updated through `normalization.write_normalized_part_bend_payload(part, role)` without rebuilding geometry; this function does not save or export files. Reimport persistence requires exporting the updated source through the existing Send to Unreal pipeline.
 
 With `Isolate Generated Export` enabled, objects that were already linked directly to `Export` are preserved in `Cluster_Source_Reference`. This prevents a source rig or an older export from being collected together with the three normalized outputs. The collection move participates in the same rollback transaction as asset generation.
 
