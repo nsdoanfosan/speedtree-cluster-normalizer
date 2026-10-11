@@ -9,7 +9,7 @@ This add-on owns only:
 - deform-group part detection,
 - validated attachment-origin normalization with preserved `Start`/`End` lineage,
 - origin-safe 3D part and plan construction,
-- persistent root-to-tip Nanite bend weights on normalized 3D leaf parts,
+- persistent root-to-tip Nanite bend weights on normalized 3D leaf and cluster parts,
 - exact camera-SPM cutout contract validation and boundary UV transfer,
 - Send to Unreal hierarchy preparation,
 - configuration handoff to the existing Atlas add-on.
@@ -17,6 +17,44 @@ This add-on owns only:
 It does not export directly to Unreal and does not duplicate the Atlas add-on's SPM transaction code. Unreal delivery must use Send to Unreal. SPM modification must use Atlas Leaf Mesh Builder's existing `Target SPMs` and `Build/Update Target SPMs` operation.
 
 It can additionally bake a self-contained eight-map capture from the source 3D meshes. This is a Blender-side texture capture only: it does not overwrite an SPM, alter Atlas cutout geometry, or bypass Send to Unreal.
+
+### Assembly wind payload (v2)
+
+All normalized `leaf`, `leaf_side`, and `cluster` families receive UV3. The semantic
+`cluster` role uses ordinary bend code 1; `leaf_side` uses code 2. `branch` parts retain
+their DynamicWind path. In the attachment frame, let `mask=clamp(Y/maxY,0,1)`
+and `r=bboxY/max(bboxX,bboxZ)`. UV3 stores
+`U=8+mask*sqrt(max(1,r))`, `V=1-role` (FBX flips V to role 1/2 in Unreal).
+With the default material weight exponent 2, the final weight is
+`mask²*max(1,r)`. A square or wider part keeps its previous curve; the root
+stays zero. Changing exponent E also changes the gain to `max(1,r)^(E/2)`.
+There is no artistic clamp on the aspect ratio. Degenerate/nonfinite bounds
+are rejected, and the existing final WPO guard remains in the material.
+
+The receipt includes measured normalized bounds, gain, correction and protected
+UV0–2 hashes. Batch cache validation requires the v2 receipt. Unreal must use
+the v2 shared frame adapter, which accepts X above 9 without saturating the
+corrected weight. It verifies every imported corner and the exact FBX import
+generation before remapping materials; missing source payloads are never
+generated as a replacement inside Unreal. Delivery still uses the normal
+capture → Atlas target-SPM update → native SpeedTree export → Send to Unreal
+→ Assembly/whole-tree wind path.
+
+Production source/recipe roles should be passed explicitly through `part_bend_role`.
+An explicit `leaf`, `leaf_side`, or `cluster` role works with any asset name;
+explicit `branch` or `NONE` disables the payload. The `AUTO` name rule is a legacy
+fallback for canonical leaf/cluster families and leaves unknown families disabled.
+Capture roles remain separate from this setting. Runtime deformation reads the
+validated UV3 payload; asset paths identify delivery and source provenance.
+
+The reserved U tag `8` identifies an authored payload. After skeletal FBX import,
+Unreal UV3 is `(8+x, role_code)`, where `x=mask*aspect_correction` and V is role 1
+or 2. A pinned root is `(8, role_code)` with zero bend weight. An uninitialized
+`(0,0)` UV3 has neither the tag nor a bend role and is not accepted as source
+payload. Blender V is `1-role_code` before FBX flips it; the U tag still separates
+ordinary Blender `(8,0)` root data from uninitialized `(0,0)`. This payload adds
+aspect weighting and source role selection; it performs no mesh or rendering
+optimization.
 
 ## Blender UI
 
@@ -58,9 +96,9 @@ Export
 
 The top Empty supplies the asset name through Send to Unreal's `Use Immediate Parent Name`. The mesh geometry, part armature, and root bone are already normalized; the Empty is not treated as a substitute for transform normalization.
 
-With the default `AUTO` policy, normalized Elm `SK_leaf_elm_*` prototypes receive UV3 `nanite_part_bend`; names with a separate `side` token use the side role. Other species and families, including branch, keep their UV layout. The original UV0/UV1/UV2, vertex colors, geometry, weights, and active/render/clone UV choices are preserved. A missing third channel or occupied UV3 stops the build instead of replacing existing data. The optional `part_bend_role` argument accepts `AUTO`, `leaf`, `leaf_side`, or `NONE`; explicit roles remain available for a separately authorized rollout.
+The UI's `Part Bend Role`, the optional `part_bend_role` build argument, and the physical-delivery CLI's `--part-bend-role` accept `AUTO`, `leaf`, `leaf_side`, `cluster`, or `NONE`. Explicit roles take priority over names. Under legacy `AUTO`, canonical `SK_leaf_*` and `SK_cluster_*` prototypes receive UV3 `nanite_part_bend` across species. A separate `side` token selects `leaf_side` only in a leaf family; a cluster remains `cluster`. Branch and unknown families keep their UV layout. The original UV0/UV1/UV2, vertex colors, geometry, weights, and active/render/clone UV choices are preserved. A missing third channel or occupied UV3 stops the build instead of replacing existing data. This setting is independent of the existing branch/leaf/leaf_side capture role and Atlas plan collection.
 
-The weight is `clamp(localY / maxLocalY, 0, 1)` after normalization, so the attachment origin stays at weight zero even if the mesh bounds extend slightly behind it. Blender stores `UV3=(8+weight, 1-role)`, with role `1` for leaf and `2` for side; the skeletal FBX import's V flip produces Unreal `(8+weight, role)`. UV0 texture coordinates are not used for this mask. The generated mesh and object record the encoding and bounds under `speedtree_cluster_part_bend_payload`, and normalization receipts include the same payload. Saved normalized 3D Export objects can be updated through `normalization.write_normalized_part_bend_payload(part, role)` without rebuilding geometry; this function does not save or export files. Reimport persistence requires exporting the updated source through the existing Send to Unreal pipeline.
+The mask is `clamp(localY / maxLocalY, 0, 1)` after normalization, so the attachment origin stays at zero even if the mesh bounds extend slightly behind it. Blender stores `UV3=(8+mask*aspect_correction, 1-role_code)`, with code `1` for leaf/cluster and `2` for leaf_side; the skeletal FBX import's V flip produces Unreal `(8+mask*aspect_correction, role_code)`. UV0 texture coordinates are not used for this mask. The generated mesh and object record the semantic role, encoding, and bounds under `speedtree_cluster_part_bend_payload`, and normalization receipts include the same payload. Saved normalized 3D Export objects can be updated through `normalization.write_normalized_part_bend_payload(part, role)` without rebuilding geometry; this function does not save or export files. Reimport persistence requires exporting the updated source through the existing Send to Unreal pipeline.
 
 With `Isolate Generated Export` enabled, objects that were already linked directly to `Export` are preserved in `Cluster_Source_Reference`. This prevents a source rig or an older export from being collected together with the three normalized outputs. The collection move participates in the same rollback transaction as asset generation.
 

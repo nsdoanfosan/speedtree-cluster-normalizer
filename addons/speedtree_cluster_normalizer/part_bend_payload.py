@@ -1,4 +1,4 @@
-"""Durable, origin-anchored bend weights for normalized 3D leaf parts."""
+"""Durable, origin-anchored bend weights for normalized 3D parts."""
 
 from array import array
 import hashlib
@@ -11,18 +11,22 @@ PART_BEND_UV_NAME = "nanite_part_bend"
 PART_BEND_UV_INDEX = 3
 PART_BEND_U_TAG = 8.0
 PART_BEND_METADATA_KEY = "speedtree_cluster_part_bend_payload"
-PART_BEND_ROLE_CODES = {"leaf": 1, "leaf_side": 2}
+PART_BEND_ROLE_CODES = {"leaf": 1, "leaf_side": 2, "cluster": 1}
+PART_BEND_ASPECT_POLICY = "normalized_bbox_y_over_max_xz/sqrt_gain/v2"
+PART_BEND_REFERENCE_EXPONENT = 2.0
 
 
 def resolve_part_bend_role(asset_name, requested_role="AUTO"):
-    """AUTO enables Elm leaf parts; other species retain their existing UVs."""
+    """Resolve semantic source roles; branches keep DynamicWind in AUTO."""
     requested_role = str(requested_role or "AUTO").strip().lower()
     if requested_role == "auto":
         tokens = re.sub(r"^sk_", "", str(asset_name).lower()).split("_")
-        if not tokens or tokens[0] != "leaf":
+        if not tokens or tokens[0] not in {"leaf", "cluster"}:
             return None
+        if tokens[0] == "cluster":
+            return "cluster" if len(tokens) > 1 and tokens[1] else None
         family = [token for token in tokens[1:] if token != "side"]
-        if not family or family[0] != "elm":
+        if not family or not family[0]:
             return None
         return "leaf_side" if "side" in tokens[1:] else "leaf"
     if requested_role in {"none", "branch"}:
@@ -44,19 +48,43 @@ def build_part_bend_vertex_payload(positions, role):
         raise ValueError("Part bend payload requires nonempty finite 3D positions.")
     maximum_y = max(position[1] for position in positions)
     if maximum_y <= 0.0:
-        raise ValueError("Normalized leaf part must extend from its origin toward +Y.")
+        raise ValueError("Normalized part must extend from its origin toward +Y.")
+    minimum = [min(position[i] for position in positions) for i in range(3)]
+    maximum = [max(position[i] for position in positions) for i in range(3)]
+    size = [hi - lo for lo, hi in zip(minimum, maximum)]
+    # max(X,Z) measures the transverse extent for both XY and side YZ parts.
+    # Units/uniform normalization cancel. Never substitute thickness for width.
+    width = max(size[0], size[2])
+    if width <= 0.0 or not math.isfinite(width):
+        raise ValueError("Part bend aspect correction requires a measurable transverse width.")
+    aspect_ratio = size[1] / width
+    gain = max(1.0, aspect_ratio)
+    correction = math.sqrt(gain)
+    # The shader permits exponents up to four. Validate that range here rather
+    # than silently turning an overflowing weight into a stationary part.
+    if (not math.isfinite(correction)
+            or correction > 3.402823466e38 ** 0.25):
+        raise ValueError("Part bend aspect correction exceeds finite float32 shader weights.")
     weights = [min(1.0, max(0.0, position[1] / maximum_y)) for position in positions]
     role_code = PART_BEND_ROLE_CODES[role]
-    # UE's skeletal FBX importer flips V. The imported channel is (8+weight, role).
-    values = [(PART_BEND_U_TAG + weight, 1.0 - role_code) for weight in weights]
+    # UE's skeletal FBX importer flips V. X includes the measured correction.
+    values = [(PART_BEND_U_TAG + weight * correction, 1.0 - role_code) for weight in weights]
     return values, {
-        "schema_version": 1,
+        "schema_version": 2,
         "role": role,
         "role_code": role_code,
         "uv_name": PART_BEND_UV_NAME,
         "uv_index": PART_BEND_UV_INDEX,
-        "blender_encoding": "U=8+clamp(Y/maxY,0,1);V=1-role_code",
-        "unreal_encoding": "U=8+mask;V=role_code",
+        "blender_encoding": "U=8+clamp(Y/maxY,0,1)*sqrt(max(1,bboxY/max(bboxX,bboxZ)));V=1-role_code",
+        "unreal_encoding": "U=8+mask*aspect_correction;V=role_code",
+        "aspect_policy": PART_BEND_ASPECT_POLICY,
+        "reference_weight_exponent": PART_BEND_REFERENCE_EXPONENT,
+        "normalized_bounds": {"minimum": minimum, "maximum": maximum, "size": size},
+        "aspect_ratio": aspect_ratio,
+        "aspect_gain": gain,
+        "aspect_correction": correction,
+        "corrected_weight_minimum": min(weights) * correction,
+        "corrected_weight_maximum": max(weights) * correction,
         "growth_axis_blender": "+Y",
         "growth_axis_unreal": "-Y",
         "anchor_local": [0.0, 0.0, 0.0],

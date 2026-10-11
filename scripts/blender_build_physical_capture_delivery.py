@@ -23,6 +23,11 @@ def parse_args():
     parser.add_argument("--save-to", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--role", choices=("branch", "leaf", "leaf_side"), required=True)
+    parser.add_argument(
+        "--part-bend-role",
+        choices=("AUTO", "NONE", "leaf", "leaf_side", "cluster"),
+        default="AUTO",
+    )
     parser.add_argument("--source-object", required=True)
     parser.add_argument("--source-xml", required=True)
     parser.add_argument("--plan-base", required=True)
@@ -170,6 +175,7 @@ def main():
     props.source_partition_mode = args.source_partition_mode
     props.plan_base_name = args.plan_base
     props.skeletal_base_name = args.skeletal_base
+    props.part_bend_role = args.part_bend_role
     props.plan_collection = args.plan_collection
     props.plan_material_name = args.material
     props.source_material_name = args.source_material or args.material
