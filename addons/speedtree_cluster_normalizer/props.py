@@ -97,6 +97,17 @@ class STCLUSTER_Properties(PropertyGroup):
         default="SK_branch_elm_01",
         description="Base name for Send to Unreal pivot assets such as SK_branch_elm_01_01",
     )
+    part_bend_role: EnumProperty(
+        name="Part Bend Role",
+        items=(
+            ("AUTO", "Auto", "Use canonical leaf or cluster roles; branch keeps DynamicWind"),
+            ("NONE", "Disabled", "Preserve the normalized part's existing UV channels"),
+            ("leaf", "Leaf", "Ordinary bending for normalized leaf parts"),
+            ("leaf_side", "Leaf Side", "Side bending for normalized leaf parts"),
+            ("cluster", "Cluster", "Ordinary bending while preserving the cluster source role"),
+        ),
+        default="AUTO",
+    )
     plan_collection: StringProperty(
         name="Plan Collection",
         default="Atlas_Branch_Plans",

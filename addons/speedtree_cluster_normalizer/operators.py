@@ -121,6 +121,7 @@ class STCLUSTER_OT_build(Operator):
                 source_xml_path=props.source_xml_path,
                 workflow_mode=props.workflow_mode,
                 physical_capture_contract=capture_contract,
+                part_bend_role=props.part_bend_role,
             )
             if (
                 props.workflow_mode == WORKFLOW_PHYSICAL_DIRECT_CAPTURE
@@ -314,6 +315,7 @@ class STCLUSTER_PT_panel(Panel):
         names = layout.column(align=True)
         names.prop(props, "plan_base_name")
         names.prop(props, "skeletal_base_name")
+        names.prop(props, "part_bend_role")
         names.prop(props, "plan_collection")
         names.prop(props, "plan_material_name")
         names.prop(props, "source_material_name")
